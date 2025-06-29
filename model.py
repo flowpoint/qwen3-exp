@@ -382,7 +382,7 @@ if __name__ == "__main__":
         tokenizer = Qwen3Tokenizer(str(tokenizer_path), add_generation_prompt=True)
 
     # Prepare input
-    prompt = "Give me a short introduction to large language models."
+    prompt = "how are "
     input_ids = tokenizer.encode(prompt)
     if len(input_ids) > QWEN3_CONFIG["context_length"]:
         input_ids = input_ids[:QWEN3_CONFIG["context_length"]]
@@ -406,7 +406,7 @@ if __name__ == "__main__":
     output_token_ids = generate(
         model=model, 
         idx=input_token_ids, 
-        max_new_tokens=100,
+        max_new_tokens=2,
         context_size=QWEN3_CONFIG["context_length"], 
         top_k=50,
         temperature=0.7
