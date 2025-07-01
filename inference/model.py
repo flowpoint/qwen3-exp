@@ -58,12 +58,11 @@ def download_model_from_hf(repo_id, local_dir="./model_cache"):
 def safe_convert_numpy_to_jax(numpy_array):
     if numpy_array.dtype in [np.float16]:
         numpy_array = numpy_array.astype(np.float32)
-    return jax.device_put(jnp.array(numpy_array), device)
-
+    return jnp.array(numpy_array)
 
 def batch_convert_numpy_weights(numpy_weights_dict):
-    return {key: safe_convert_numpy_to_jax(array) for key, array in numpy_weights_dict.items()}
-
+    converted = {key: safe_convert_numpy_to_jax(array) for key, array in numpy_weights_dict.items()}
+    return jax.tree.map(lambda x: jax.device_put(x, device), converted)
 
 def cleanup_memory():
     if torch.cuda.is_available():
@@ -71,11 +70,13 @@ def cleanup_memory():
         torch.cuda.synchronize()
     gc.collect()
 
+@jax.jit
 def feedforward_forward(params, x):
     gate = jax.nn.silu(jnp.einsum('bse,eh->bsh', x, params["gate_proj"]))
     up = jnp.einsum('bse,eh->bsh', x, params["up_proj"])
     return jnp.einsum('bsh,he->bse', gate * up, params["down_proj"])
 
+@jax.jit
 def rmsnorm_forward(params, x, eps=1e-6):
     orig_dtype = x.dtype
     x = x.astype(jnp.float32)
@@ -87,7 +88,7 @@ def compute_rope_params(head_dim, theta_base=10000.0, context_length=4096):
     inv_freq = 1.0 / (theta_base ** (jnp.arange(0, head_dim, 2) / head_dim))
     positions = jnp.arange(context_length)
     angles = jnp.concatenate([positions[:, None] * inv_freq[None, :]] * 2, axis=1)
-    return jax.device_put(jnp.cos(angles), device), jax.device_put(jnp.sin(angles), device)
+    return jnp.cos(angles), jnp.sin(angles)
 
 def apply_rope(x, cos, sin):
     seq_len = x.shape[2]
@@ -96,15 +97,31 @@ def apply_rope(x, cos, sin):
     rotated = jnp.concatenate([-x2, x1], axis=-1)
     return ((x * cos) + (rotated * sin)).astype(x.dtype)
 
+def apply_rope_with_offset(x, cos, sin, position_offset=0):
+    seq_len = x.shape[2]
+    x1, x2 = x[..., :x.shape[-1]//2], x[..., x.shape[-1]//2:]
+    
+    positions = jnp.arange(position_offset, position_offset + seq_len)
+    cos_slice = cos[positions, :][None, None, :, :]
+    sin_slice = sin[positions, :][None, None, :, :]
+    
+    rotated = jnp.concatenate([-x2, x1], axis=-1)
+    return ((x * cos_slice) + (rotated * sin_slice)).astype(x.dtype)
+
 def apply_qk_norm(x, norm_params):
     b, h, s, d = x.shape
     x_reshaped = x.reshape(b * h * s, d)
     x_normed = rmsnorm_forward(norm_params, x_reshaped)
     return x_normed.reshape(b, h, s, d)
 
-def grouped_query_attention_forward_simple(params, x, mask, cos, sin, num_heads, num_kv_groups, head_dim, qk_norm=False):
+def grouped_query_attention_forward_kv(params, x, mask, cos, sin, num_heads, num_kv_groups, head_dim, kv_cache=None, qk_norm=False):
     b, seq, d_in = x.shape
     group_size = num_heads // num_kv_groups
+    
+    if kv_cache is not None and kv_cache["keys"].shape[2] > 0:
+        position_offset = kv_cache["keys"].shape[2]
+    else:
+        position_offset = 0
     
     queries = jnp.einsum('bsd,dh->bsh', x, params["W_query"]).reshape(b, seq, num_heads, head_dim).transpose(0,2,1,3)
     keys = jnp.einsum('bsd,dh->bsh', x, params["W_key"]).reshape(b, seq, num_kv_groups, head_dim).transpose(0,2,1,3)
@@ -114,29 +131,45 @@ def grouped_query_attention_forward_simple(params, x, mask, cos, sin, num_heads,
         queries = apply_qk_norm(queries, params["q_norm"])
         keys = apply_qk_norm(keys, params["k_norm"])
 
-    queries, keys = apply_rope(queries, cos, sin), apply_rope(keys, cos, sin)
-    keys, values = jnp.repeat(keys, group_size, axis=1), jnp.repeat(values, group_size, axis=1)
+    queries = apply_rope_with_offset(queries, cos, sin, position_offset)
+    keys = apply_rope_with_offset(keys, cos, sin, position_offset)
     
-    attn_scores = jnp.einsum('bnqh,bnkh->bnqk', queries, keys) / jnp.sqrt(head_dim)
-    attn_scores = jnp.where(mask, -jnp.inf, attn_scores)
+    if kv_cache is not None and kv_cache["keys"].shape[2] > 0:
+        keys = jnp.concatenate([kv_cache["keys"], keys], axis=2)
+        values = jnp.concatenate([kv_cache["values"], values], axis=2)
+    
+    new_cache = {"keys": keys, "values": values}
+    
+    keys_expanded = jnp.repeat(keys, group_size, axis=1)
+    values_expanded = jnp.repeat(values, group_size, axis=1)
+    
+    attn_scores = jnp.einsum('bnqh,bnkh->bnqk', queries, keys_expanded) / jnp.sqrt(head_dim)
+    
+    if kv_cache is None or kv_cache["keys"].shape[2] == 0:
+        q_len, k_len = queries.shape[2], keys.shape[2]
+        causal_mask = jnp.triu(jnp.ones((q_len, k_len)), k=1)
+        attn_scores = jnp.where(causal_mask[None, None, :, :], -jnp.inf, attn_scores)
+    
     attn_weights = jax.nn.softmax(attn_scores, axis=-1)
-    context = jnp.einsum('bnqk,bnkh->bnqh', attn_weights, values)
+    context = jnp.einsum('bnqk,bnkh->bnqh', attn_weights, values_expanded)
     context = context.transpose(0,2,1,3).reshape(b, seq, num_heads * head_dim)
-    return jnp.einsum('bsh,hd->bsd', context, params["out_proj"])
+    output = jnp.einsum('bsh,hd->bsd', context, params["out_proj"])
+    
+    return output, new_cache
 
-def transformer_block_forward_simple(params, x, mask, cos, sin, cfg):
+def transformer_block_forward_kv(params, x, mask, cos, sin, cfg, kv_cache=None):
     shortcut = x
     x = rmsnorm_forward(params["norm1"], x)
-    x = grouped_query_attention_forward_simple(params["att"], x, mask, cos, sin, cfg["n_heads"], cfg["n_kv_groups"], cfg["head_dim"], cfg["qk_norm"])
+    x, new_cache = grouped_query_attention_forward_kv(params["att"], x, mask, cos, sin, cfg["n_heads"], cfg["n_kv_groups"], cfg["head_dim"], kv_cache, cfg["qk_norm"])
     x = x + shortcut
     shortcut = x
     x = rmsnorm_forward(params["norm2"], x)
     x = feedforward_forward(params["ff"], x)
-    return x + shortcut
+    return x + shortcut, new_cache
 
 def init_qwen3_params(key, cfg):
     k_emb, k_blocks, k_final_norm, k_out = jax.random.split(key, 4)
-    tok_emb = jax.device_put(jax.random.normal(k_emb, (cfg["vocab_size"], cfg["emb_dim"])) / jnp.sqrt(cfg["vocab_size"]), device)
+    tok_emb = jax.random.normal(k_emb, (cfg["vocab_size"], cfg["emb_dim"])) / jnp.sqrt(cfg["vocab_size"])
     block_keys = jax.random.split(k_blocks, cfg["n_layers"])
     
     def init_block_params(k):
@@ -145,57 +178,70 @@ def init_qwen3_params(key, cfg):
         k_gate, k_up, k_down = jax.random.split(k_ff, 3)
         
         att_params = {
-            "W_query": jax.device_put(jax.random.normal(kq, (cfg["emb_dim"], cfg["n_heads"] * cfg["head_dim"])) / jnp.sqrt(cfg["emb_dim"]), device),
-            "W_key": jax.device_put(jax.random.normal(kk, (cfg["emb_dim"], cfg["n_kv_groups"] * cfg["head_dim"])) / jnp.sqrt(cfg["emb_dim"]), device),
-            "W_value": jax.device_put(jax.random.normal(kv, (cfg["emb_dim"], cfg["n_kv_groups"] * cfg["head_dim"])) / jnp.sqrt(cfg["emb_dim"]), device),
-            "out_proj": jax.device_put(jax.random.normal(ko, (cfg["n_heads"] * cfg["head_dim"], cfg["emb_dim"])) / jnp.sqrt(cfg["n_heads"] * cfg["head_dim"]), device),
+            "W_query": jax.random.normal(kq, (cfg["emb_dim"], cfg["n_heads"] * cfg["head_dim"])) / jnp.sqrt(cfg["emb_dim"]),
+            "W_key": jax.random.normal(kk, (cfg["emb_dim"], cfg["n_kv_groups"] * cfg["head_dim"])) / jnp.sqrt(cfg["emb_dim"]),
+            "W_value": jax.random.normal(kv, (cfg["emb_dim"], cfg["n_kv_groups"] * cfg["head_dim"])) / jnp.sqrt(cfg["emb_dim"]),
+            "out_proj": jax.random.normal(ko, (cfg["n_heads"] * cfg["head_dim"], cfg["emb_dim"])) / jnp.sqrt(cfg["n_heads"] * cfg["head_dim"]),
         }
         
         if cfg["qk_norm"]:
-            att_params["q_norm"] = {"scale": jax.device_put(jnp.ones((cfg["head_dim"],)), device)}
-            att_params["k_norm"] = {"scale": jax.device_put(jnp.ones((cfg["head_dim"],)), device)}
+            att_params["q_norm"] = {"scale": jnp.ones((cfg["head_dim"],))}
+            att_params["k_norm"] = {"scale": jnp.ones((cfg["head_dim"],))}
         
         return {
             "att": att_params,
             "ff": {
-                "gate_proj": jax.device_put(jax.random.normal(k_gate, (cfg["emb_dim"], cfg["hidden_dim"])) / jnp.sqrt(cfg["emb_dim"]), device),
-                "up_proj": jax.device_put(jax.random.normal(k_up, (cfg["emb_dim"], cfg["hidden_dim"])) / jnp.sqrt(cfg["emb_dim"]), device),
-                "down_proj": jax.device_put(jax.random.normal(k_down, (cfg["hidden_dim"], cfg["emb_dim"])) / jnp.sqrt(cfg["hidden_dim"]), device),
+                "gate_proj": jax.random.normal(k_gate, (cfg["emb_dim"], cfg["hidden_dim"])) / jnp.sqrt(cfg["emb_dim"]),
+                "up_proj": jax.random.normal(k_up, (cfg["emb_dim"], cfg["hidden_dim"])) / jnp.sqrt(cfg["emb_dim"]),
+                "down_proj": jax.random.normal(k_down, (cfg["hidden_dim"], cfg["emb_dim"])) / jnp.sqrt(cfg["hidden_dim"]),
             },
-            "norm1": {"scale": jax.device_put(jnp.ones((cfg["emb_dim"],)), device)},
-            "norm2": {"scale": jax.device_put(jnp.ones((cfg["emb_dim"],)), device)},
+            "norm1": {"scale": jnp.ones((cfg["emb_dim"],))},
+            "norm2": {"scale": jnp.ones((cfg["emb_dim"],))},
         }
     
     trf_blocks = [init_block_params(k) for k in block_keys]
-    final_norm = {"scale": jax.device_put(jnp.ones((cfg["emb_dim"],)), device)}
-    out_head = jax.device_put(jax.random.normal(k_out, (cfg["emb_dim"], cfg["vocab_size"])) / jnp.sqrt(cfg["emb_dim"]), device)
+    final_norm = {"scale": jnp.ones((cfg["emb_dim"],))}
+    out_head = jax.random.normal(k_out, (cfg["emb_dim"], cfg["vocab_size"])) / jnp.sqrt(cfg["emb_dim"])
     cos, sin = compute_rope_params(cfg["head_dim"], cfg["rope_base"], cfg["context_length"])
     
-    return {"tok_emb": tok_emb, "trf_blocks": trf_blocks, "final_norm": final_norm, "out_head": out_head, "cos": cos, "sin": sin}
-
-def qwen3_forward_simple(params, x, cfg):
-    x = params["tok_emb"][x]
-    mask = jnp.triu(jnp.ones((x.shape[1], x.shape[1]), dtype=bool), k=1)
+    params = {"tok_emb": tok_emb, "trf_blocks": trf_blocks, "final_norm": final_norm, "out_head": out_head, "cos": cos, "sin": sin}
     
-    for block_params in params["trf_blocks"]:
-        x = transformer_block_forward_simple(block_params, x, mask, params["cos"], params["sin"], cfg)
+    return jax.tree.map(lambda x: jax.device_put(x, device), params)
+
+def qwen3_forward_kv(params, x, cfg, kv_cache=None):
+    x = params["tok_emb"][x]
+    mask = jnp.triu(jnp.ones((cfg["context_length"], cfg["context_length"]), dtype=bool), k=1)
+    
+    new_cache = []
+    for i, block_params in enumerate(params["trf_blocks"]):
+        layer_cache = kv_cache[i] if kv_cache else None
+        x, updated_cache = transformer_block_forward_kv(block_params, x, mask, params["cos"], params["sin"], cfg, layer_cache)
+        new_cache.append(updated_cache)
     
     x = rmsnorm_forward(params["final_norm"], x)
-    return jnp.einsum('bse,ev->bsv', x, params["out_head"])
+    logits = jnp.einsum('bse,ev->bsv', x, params["out_head"])
+    
+    return logits, new_cache
 
-def generate_simple(model, idx, max_new_tokens, context_size, temperature=0.0, top_k=None, eos_id=None):
+def generate_kv(model, idx, max_new_tokens, context_size, temperature=0.7, top_k=50, eos_id=None):
     params, cfg = model["params"], model["cfg"]
     cur_ids = jax.device_put(idx, device)
     key = jax.random.PRNGKey(42)
     
-    for i in tqdm(range(max_new_tokens),desc="Generating tokens"):
-        idx_cond = cur_ids[:, -context_size:]
-        logits = qwen3_forward_simple(params, idx_cond, cfg)
+    kv_cache = [{"keys": jnp.zeros((1, cfg["n_kv_groups"], 0, cfg["head_dim"])), 
+                 "values": jnp.zeros((1, cfg["n_kv_groups"], 0, cfg["head_dim"]))} 
+                for _ in range(cfg["n_layers"])]
+    
+    logits, kv_cache = qwen3_forward_kv(params, cur_ids, cfg, kv_cache)
+    
+    for i in tqdm(range(max_new_tokens), desc="Generating"):
         next_token_logits = logits[:, -1, :]
         
-        if top_k is not None:
-            top_k_logits, _ = jax.lax.top_k(next_token_logits[0], top_k)
-            next_token_logits = jnp.where(next_token_logits < top_k_logits[-1], -jnp.inf, next_token_logits)
+        if top_k is not None and top_k > 0:
+            top_k_logits, top_k_indices = jax.lax.top_k(next_token_logits[0], top_k)
+            mask = jnp.full_like(next_token_logits[0], -jnp.inf)
+            mask = mask.at[top_k_indices].set(top_k_logits)
+            next_token_logits = mask[None, :]
         
         if temperature > 0.0:
             next_token_logits = next_token_logits / temperature
@@ -208,6 +254,8 @@ def generate_simple(model, idx, max_new_tokens, context_size, temperature=0.0, t
             break
         
         cur_ids = jnp.concatenate([cur_ids, next_token[:, None]], axis=1)
+        
+        logits, kv_cache = qwen3_forward_kv(params, next_token[:, None], cfg, kv_cache)
     
     return cur_ids
 
@@ -300,7 +348,7 @@ if __name__ == "__main__":
     if len(input_ids) > QWEN3_CONFIG["context_length"]:
         input_ids = input_ids[:QWEN3_CONFIG["context_length"]]
     
-    input_token_ids = jnp.array([input_ids])
+    input_token_ids = jax.device_put(jnp.array([input_ids]), device)
     
     cfg = QWEN3_CONFIG
     key = jax.random.PRNGKey(0)
@@ -311,14 +359,15 @@ if __name__ == "__main__":
     import time
     start_time = time.time()
     
-    output_token_ids = generate_simple(
-        model=model, idx=input_token_ids, max_new_tokens=50,
+    # generate with KV cache
+    output_token_ids = generate_kv(
+        model=model, idx=input_token_ids, max_new_tokens=150,
         context_size=QWEN3_CONFIG["context_length"], top_k=1,
-        temperature=0.0, eos_id=151645
+        temperature=0, eos_id=None
     )
     
     generation_time = time.time() - start_time
-    output_text = tokenizer.decode(list(output_token_ids[0]))
+    output_text = tokenizer.decode(list(jax.device_get(output_token_ids[0])))
     print("\n" + "="*50)
     print("GENERATED TEXT :")
     print("="*50)
