@@ -16,9 +16,10 @@ except ImportError:
     snapshot_download = None
 
 os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
-os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.8'
+os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.5'  # Reduce to 50%
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 os.environ['JAX_PLATFORMS'] = 'gpu'
+os.environ['XLA_FLAGS'] = '--xla_gpu_force_compilation_parallelism=1'
 
 if jax.devices('gpu'):
     device = jax.devices('gpu')[0]
@@ -129,7 +130,6 @@ def init_feedforward_params(key, emb_dim, hidden_dim):
     }
     return params
 
-@jax.jit
 def feedforward_forward(params, x):
     gate = jnp.einsum('bse,eh->bsh', x, params["gate_proj"])
     gate = jax.nn.silu(gate)
@@ -143,7 +143,6 @@ def init_rmsnorm_params(emb_dim, bias=False):
         params["shift"] = jax.device_put(jnp.zeros((emb_dim,)), device)
     return params
 
-@jax.jit
 def rmsnorm_forward(params, x, eps=1e-6):
     orig_dtype = x.dtype
     x = x.astype(jnp.float32)
@@ -166,7 +165,6 @@ def compute_rope_params(head_dim, theta_base=10000.0, context_length=4096, dtype
     sin = jnp.sin(angles)
     return jax.device_put(cos, device), jax.device_put(sin, device)
 
-@jax.jit
 def apply_rope(x, cos, sin):
     batch, num_heads, seq_len, head_dim = x.shape
     x1 = x[..., : head_dim // 2]
@@ -192,17 +190,18 @@ def init_gqa_params(key, d_in, num_heads, num_kv_groups, head_dim, qk_norm=False
     
     return params
 
-@jax.jit
 def apply_qk_norm(x, norm_params):
     b, h, s, d = x.shape
     x_reshaped = x.reshape(b * h * s, d)
     x_normed = rmsnorm_forward(norm_params, x_reshaped)
     return x_normed.reshape(b, h, s, d)
 
-def grouped_query_attention_forward(params, x, mask, cos, sin, num_heads, num_kv_groups, head_dim, qk_norm=False):
+def grouped_query_attention_forward_simple(params, x, mask, cos, sin, num_heads, num_kv_groups, head_dim, qk_norm=False):
+    """Simple attention function without KV caching, similar to PyTorch version."""
     b, seq, d_in = x.shape
     group_size = num_heads // num_kv_groups
 
+    # Compute queries, keys, and values
     queries = jnp.einsum('bsd,dh->bsh', x, params["W_query"]).reshape(b, seq, num_heads, head_dim).transpose(0,2,1,3)
     keys = jnp.einsum('bsd,dh->bsh', x, params["W_key"]).reshape(b, seq, num_kv_groups, head_dim).transpose(0,2,1,3)
     values = jnp.einsum('bsd,dh->bsh', x, params["W_value"]).reshape(b, seq, num_kv_groups, head_dim).transpose(0,2,1,3)
@@ -211,19 +210,25 @@ def grouped_query_attention_forward(params, x, mask, cos, sin, num_heads, num_kv
         queries = apply_qk_norm(queries, params["q_norm"])
         keys = apply_qk_norm(keys, params["k_norm"])
 
+    # Apply RoPE
     queries = apply_rope(queries, cos, sin)
     keys = apply_rope(keys, cos, sin)
 
+    # Repeat keys and values for grouped query attention
     keys = jnp.repeat(keys, group_size, axis=1)
     values = jnp.repeat(values, group_size, axis=1)
 
+    # Compute attention
     scale = 1.0 / jnp.sqrt(head_dim)
     attn_scores = jnp.einsum('bnqh,bnkh->bnqk', queries, keys) * scale
+    
+    # Apply causal mask
     attn_scores = jnp.where(mask, -jnp.inf, attn_scores)
     attn_weights = jax.nn.softmax(attn_scores, axis=-1)
     context = jnp.einsum('bnqk,bnkh->bnqh', attn_weights, values)
     context = context.transpose(0,2,1,3).reshape(b, seq, num_heads * head_dim)
     out = jnp.einsum('bsh,hd->bsd', context, params["out_proj"])
+    
     return out
 
 def init_transformer_block_params(key, cfg):
@@ -236,20 +241,27 @@ def init_transformer_block_params(key, cfg):
     }
     return params
 
-def transformer_block_forward(params, x, mask, cos, sin, cfg):
+# Simple transformer block without KV caching
+def transformer_block_forward_simple(params, x, mask, cos, sin, cfg):
+    """Simple transformer block without KV caching, similar to PyTorch version."""
     shortcut = x
     x = rmsnorm_forward(params["norm1"], x)
-    x = grouped_query_attention_forward(params["att"], x, mask, cos, sin, 
-                                      num_heads=cfg["n_heads"], 
-                                      num_kv_groups=cfg["n_kv_groups"], 
-                                      head_dim=cfg["head_dim"], 
-                                      qk_norm=cfg["qk_norm"])
+    
+    x = grouped_query_attention_forward_simple(
+        params["att"], x, mask, cos, sin, 
+        num_heads=cfg["n_heads"], 
+        num_kv_groups=cfg["n_kv_groups"], 
+        head_dim=cfg["head_dim"], 
+        qk_norm=cfg["qk_norm"]
+    )
+    
     x = x + shortcut
 
     shortcut = x
     x = rmsnorm_forward(params["norm2"], x)
     x = feedforward_forward(params["ff"], x)
     x = x + shortcut
+    
     return x
 
 def init_qwen3_params(key, cfg):
@@ -270,62 +282,66 @@ def init_qwen3_params(key, cfg):
     }
     return params
 
-def qwen3_forward(params, x, cfg):
+# Simple forward pass without KV caching (like PyTorch)
+def qwen3_forward_simple(params, x, cfg):
+    """Simple forward pass without KV caching, similar to PyTorch version."""
     tok_emb = params["tok_emb"]
     x = tok_emb[x]
     num_tokens = x.shape[1]
+    
+    # Standard causal mask
     mask = jnp.triu(jnp.ones((num_tokens, num_tokens), dtype=bool), k=1)
+    
     for block_params in params["trf_blocks"]:
-        x = transformer_block_forward(block_params, x, mask, params["cos"], params["sin"], cfg)
+        x = transformer_block_forward_simple(
+            block_params, x, mask, params["cos"], params["sin"], cfg
+        )
+    
     x = rmsnorm_forward(params["final_norm"], x)
     logits = jnp.einsum('bse,ev->bsv', x, params["out_head"])
+    
     return logits
 
-def generate(model, idx, max_new_tokens, context_size=None, top_k=1, temperature=0.0, eos_id=None):
+# Simplified generation function like PyTorch
+def generate_simple(model, idx, max_new_tokens, context_size, temperature=0.0, top_k=None, eos_id=None):
+    """Simple generation function without KV caching, similar to PyTorch version."""
     params = model["params"]
     cfg = model["cfg"]
     
-    if context_size is None:
-        context_size = cfg["context_length"]
-    
     cur_ids = jax.device_put(idx, device)
-    
-    @jax.jit
-    def compiled_forward(params, x):
-        return qwen3_forward(params, x, cfg)
-    
-    # Create a proper random key
     key = jax.random.PRNGKey(42)
     
-    with tqdm(total=max_new_tokens, desc="Generating tokens") as pbar:
-        for i in range(max_new_tokens):
-            idx_cond = cur_ids[:, -context_size:]
-            logits = compiled_forward(params, idx_cond)
-            next_token_logits = logits[:, -1, :]
-            
-            if temperature > 0.0:
-                next_token_logits = next_token_logits / temperature
-                if top_k > 1:
-                    top_k_logits, top_k_indices = jax.lax.top_k(next_token_logits[0], top_k)
-                    key, subkey = jax.random.split(key)
-                    next_token_idx = jax.random.categorical(subkey, top_k_logits)
-                    next_token = top_k_indices[next_token_idx][None]
-                else:
-                    key, subkey = jax.random.split(key)
-                    next_token = jax.random.categorical(subkey, next_token_logits, axis=-1)
-            else:
-                next_token = jnp.argmax(next_token_logits, axis=-1)
-            
-            cur_ids = jnp.concatenate([cur_ids, next_token[:, None]], axis=1)
-            
-            pbar.update(1)
-            
-            # Print generated token for debugging
-            if i < 10:  # Print first 10 tokens for debugging
-                print(f"Token {i}: {int(next_token[0])}")
-            
-            if eos_id is not None and int(next_token[0]) == eos_id:
-                break
+    for i in range(max_new_tokens):
+        # Use sliding window like PyTorch
+        idx_cond = cur_ids[:, -context_size:]
+        
+        # Get logits
+        logits = qwen3_forward_simple(params, idx_cond, cfg)
+        next_token_logits = logits[:, -1, :]
+        
+        # Filter logits with top_k sampling
+        if top_k is not None:
+            top_k_logits, top_k_indices = jax.lax.top_k(next_token_logits[0], top_k)
+            min_val = top_k_logits[-1]
+            next_token_logits = jnp.where(next_token_logits < min_val, -jnp.inf, next_token_logits)
+        
+        # Apply temperature scaling
+        if temperature > 0.0:
+            next_token_logits = next_token_logits / temperature
+            # Apply softmax to get probabilities
+            probs = jax.nn.softmax(next_token_logits, axis=-1)
+            # Sample from the distribution
+            key, subkey = jax.random.split(key)
+            next_token = jax.random.categorical(subkey, next_token_logits, axis=-1)
+        else:
+            # Get the token with highest logits
+            next_token = jnp.argmax(next_token_logits, axis=-1)
+        
+        if eos_id is not None and int(next_token[0]) == eos_id:
+            break
+        
+        # Append sampled token to sequence
+        cur_ids = jnp.concatenate([cur_ids, next_token[:, None]], axis=1)
     
     return cur_ids
 
@@ -367,7 +383,7 @@ def load_and_convert_file_weights(file_path, jax_params, cfg):
             file_weights["tok_emb"] = tensor
         elif key == "model.norm.weight":
             file_weights["final_norm"] = tensor
-        elif key == "lm_head.weight":  # Add this line to load output head weights
+        elif key == "lm_head.weight":
             file_weights["out_head"] = tensor
         elif key.startswith("model.layers."):
             parts = key.split(".")
@@ -385,7 +401,7 @@ def load_and_convert_file_weights(file_path, jax_params, cfg):
         if "final_norm" in converted_global:
             jax_params["final_norm"]["scale"] = converted_global["final_norm"]
             
-        if "out_head" in converted_global:  # Use loaded weights instead of tied embeddings
+        if "out_head" in converted_global:
             jax_params["out_head"] = converted_global["out_head"].T
     
     # Convert and assign layer weights
@@ -411,6 +427,23 @@ def load_qwen3_weights_jax_optimized(param_config, jax_params, safetensors_files
     
     return jax_params
 
+def estimate_kv_cache_memory(batch_size, max_seq_len, num_layers, num_kv_groups, head_dim, dtype=jnp.bfloat16):
+    """Estimate KV cache memory usage in MB."""
+    # Each cache has 2 tensors (K and V) per layer
+    # Shape: (batch_size, num_kv_groups, max_seq_len, head_dim)
+    elements_per_cache = batch_size * num_kv_groups * max_seq_len * head_dim
+    total_elements = elements_per_cache * 2 * num_layers  # 2 for K and V
+    
+    if dtype == jnp.bfloat16 or dtype == jnp.float16:
+        bytes_per_element = 2
+    else:  # float32
+        bytes_per_element = 4
+    
+    total_bytes = total_elements * bytes_per_element
+    total_mb = total_bytes / (1024 * 1024)
+    return total_mb
+
+
 if __name__ == "__main__":
     HF_REPO_ID = "Qwen/Qwen3-0.6B"
     
@@ -421,19 +454,17 @@ if __name__ == "__main__":
     # Initialize tokenizer
     tokenizer_path = model_path / "tokenizer.json"
     if not tokenizer_path.exists():
-        tokenizer = Qwen3Tokenizer("tokenizer.json", repo_id=HF_REPO_ID, add_generation_prompt=True)
+        tokenizer = Qwen3Tokenizer("tokenizer.json", repo_id=HF_REPO_ID, add_generation_prompt=True, add_thinking=False)
     else:
-        tokenizer = Qwen3Tokenizer(str(tokenizer_path), add_generation_prompt=True)
+        tokenizer = Qwen3Tokenizer(str(tokenizer_path), add_generation_prompt=True, add_thinking=False)
 
-    # Prepare input - Use a simpler prompt for testing
-    prompt = "What is a large language model?"
+    # Prepare input
+    prompt = "Give me a short introduction to large language models."
     input_ids = tokenizer.encode(prompt)
     if len(input_ids) > QWEN3_CONFIG["context_length"]:
         input_ids = input_ids[:QWEN3_CONFIG["context_length"]]
     
-    print(f"Input prompt: {prompt}")
-    print(f"Input token IDs: {input_ids}")
-    print(f"Decoded input: {tokenizer.decode(input_ids)}")
+  
     
     # Convert to JAX array with proper shape (batch_size, seq_len)
     input_token_ids = jnp.array([input_ids])
@@ -450,38 +481,27 @@ if __name__ == "__main__":
     
     model = {"params": params, "cfg": cfg}
     
-    # Test with greedy decoding first
-    print("\n=== Testing with greedy decoding ===")
-    output_token_ids = generate(
+    # Test with simple generation (like PyTorch)
+ 
+    import time
+    start_time = time.time()
+    
+    output_token_ids = generate_simple(
         model=model, 
         idx=input_token_ids, 
-        max_new_tokens=20,  # Reduced for testing
+        max_new_tokens=150,
         context_size=QWEN3_CONFIG["context_length"], 
         top_k=1,
-        temperature=0.0  # Greedy decoding
+        temperature=0.0,
+        eos_id=151645  # <|im_end|> token ID
     )
+    
+    generation_time = time.time() - start_time
     
     output_text = tokenizer.decode(list(output_token_ids[0]))
     print("\n" + "="*50)
-    print("GENERATED TEXT (Greedy):")
+    print("GENERATED TEXT :")
     print("="*50)
     print(output_text)
-    print("="*50)
-    
-    # Test with sampling
-    print("\n=== Testing with sampling ===")
-    output_token_ids = generate(
-        model=model, 
-        idx=input_token_ids, 
-        max_new_tokens=20,
-        context_size=QWEN3_CONFIG["context_length"], 
-        top_k=50,
-        temperature=0.7
-    )
-    
-    output_text = tokenizer.decode(list(output_token_ids[0]))
-    print("\n" + "="*50)
-    print("GENERATED TEXT (Sampling):")
-    print("="*50)
-    print(output_text)
+    print(f"Time taken: {generation_time:.2f}s")
     print("="*50)
