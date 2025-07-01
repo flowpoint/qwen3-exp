@@ -3,6 +3,10 @@
 > [!IMPORTANT] 
 >  a clean, pure jax implementation of Qwen3-0.6B for inference with optimized memory usage and KV caching.
 
+## output 
+
+![img](output.png)
+
 ## features
 
 - pure jax implementation with no PyTorch dependencies for inference
@@ -19,7 +23,7 @@ cd qwen3-exp
 pip install -U "jax[cuda12]" tokenizers torch safetensors huggingface-hub tqdm numpy
 
 # run inference
-python qwen3.py
+python src/qwen3.py
 ```
 
 ## usage
