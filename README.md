@@ -5,7 +5,7 @@
 
 ## output 
 
-![img](output.png)
+![img](src/output.png)
 
 ## features
 
