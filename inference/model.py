@@ -223,13 +223,16 @@ def qwen3_forward_kv(params, x, cfg, kv_cache=None):
     
     return logits, new_cache
 
-def generate_kv(model, idx, max_new_tokens, context_size, temperature=0.7, top_k=50, eos_id=None):
+def generate_kv_optimized(model, idx, max_new_tokens, context_size, temperature=0.7, top_k=50, eos_id=None, batch_size=1):
     params, cfg = model["params"], model["cfg"]
-    cur_ids = jax.device_put(idx, device)
+    
+    # Keep input on device
+    cur_ids = jnp.array([idx] * batch_size) if batch_size > 1 else jnp.array([idx])
     key = jax.random.PRNGKey(42)
     
-    kv_cache = [{"keys": jnp.zeros((1, cfg["n_kv_groups"], 0, cfg["head_dim"])), 
-                 "values": jnp.zeros((1, cfg["n_kv_groups"], 0, cfg["head_dim"]))} 
+    # Initialize KV cache for batch processing
+    kv_cache = [{"keys": jnp.zeros((batch_size, cfg["n_kv_groups"], 0, cfg["head_dim"])), 
+                 "values": jnp.zeros((batch_size, cfg["n_kv_groups"], 0, cfg["head_dim"]))} 
                 for _ in range(cfg["n_layers"])]
     
     logits, kv_cache = qwen3_forward_kv(params, cur_ids, cfg, kv_cache)
@@ -238,10 +241,13 @@ def generate_kv(model, idx, max_new_tokens, context_size, temperature=0.7, top_k
         next_token_logits = logits[:, -1, :]
         
         if top_k is not None and top_k > 0:
-            top_k_logits, top_k_indices = jax.lax.top_k(next_token_logits[0], top_k)
-            mask = jnp.full_like(next_token_logits[0], -jnp.inf)
-            mask = mask.at[top_k_indices].set(top_k_logits)
-            next_token_logits = mask[None, :]
+            # Vectorized top_k for batch processing
+            top_k_logits, top_k_indices = jax.lax.top_k(next_token_logits, top_k)
+            mask = jnp.full_like(next_token_logits, -jnp.inf)
+            mask = jnp.take_along_axis(mask, top_k_indices, axis=-1)
+            mask = jnp.where(jnp.arange(mask.shape[-1])[None, :] < top_k, top_k_logits, -jnp.inf)
+            next_token_logits = jnp.full_like(next_token_logits, -jnp.inf)
+            next_token_logits = next_token_logits.at[jnp.arange(batch_size)[:, None], top_k_indices].set(mask)
         
         if temperature > 0.0:
             next_token_logits = next_token_logits / temperature
@@ -250,11 +256,13 @@ def generate_kv(model, idx, max_new_tokens, context_size, temperature=0.7, top_k
         else:
             next_token = jnp.argmax(next_token_logits, axis=-1)
         
-        if eos_id is not None and int(next_token[0]) == eos_id:
+        # Check EOS for all sequences in batch - keep on device
+        if eos_id is not None and jnp.any(next_token == eos_id):
             break
         
         cur_ids = jnp.concatenate([cur_ids, next_token[:, None]], axis=1)
         
+        # Process next tokens for entire batch
         logits, kv_cache = qwen3_forward_kv(params, next_token[:, None], cfg, kv_cache)
     
     return cur_ids
@@ -348,7 +356,8 @@ if __name__ == "__main__":
     if len(input_ids) > QWEN3_CONFIG["context_length"]:
         input_ids = input_ids[:QWEN3_CONFIG["context_length"]]
     
-    input_token_ids = jax.device_put(jnp.array([input_ids]), device)
+    # Keep input on device from start
+    input_token_ids = jnp.array(input_ids)
     
     cfg = QWEN3_CONFIG
     key = jax.random.PRNGKey(0)
@@ -359,15 +368,17 @@ if __name__ == "__main__":
     import time
     start_time = time.time()
     
-    # generate with KV cache
-    output_token_ids = generate_kv(
-        model=model, idx=input_token_ids, max_new_tokens=150,
+    # Generate with optimized function (batch_size=1 for single sequence)
+    output_token_ids = generate_kv_optimized(
+        model=model, idx=input_token_ids, max_new_tokens=50,
         context_size=QWEN3_CONFIG["context_length"], top_k=1,
-        temperature=0, eos_id=None
+        temperature=0, eos_id=None, batch_size=1
     )
     
     generation_time = time.time() - start_time
-    output_text = tokenizer.decode(list(jax.device_get(output_token_ids[0])))
+    
+    # Only move to CPU at the very end for decoding
+    output_text = tokenizer.decode(list(output_token_ids[0]))
     print("\n" + "="*50)
     print("GENERATED TEXT :")
     print("="*50)
