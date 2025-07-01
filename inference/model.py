@@ -130,10 +130,11 @@ def init_feedforward_params(key, emb_dim, hidden_dim):
 
 @jax.jit
 def feedforward_forward(params, x):
+    # Fixed: Apply fc1 to input, then fc2 to fc1 output
     x_fc1 = jnp.einsum('bse,eh->bsh', x, params["fc1"])
-    x_fc2 = jnp.einsum('bse,eh->bsh', x, params["fc2"])
+    x_fc2 = jnp.einsum('bsh,he->bse', x_fc1, params["fc2"])  # Use x_fc1, not x
     x = jax.nn.silu(x_fc1) * x_fc2
-    out = jnp.einsum('bsh,he->bse', x, params["fc3"])
+    out = jnp.einsum('bse,eh->bsh', x, params["fc3"])
     return out
 
 def init_rmsnorm_params(emb_dim, bias=False):
@@ -176,7 +177,7 @@ def apply_rope(x, cos, sin):
     x_rotated = (x * cos) + (rotated * sin)
     return x_rotated.astype(x.dtype)
 
-def init_gqa_params(key, d_in, num_heads, num_kv_groups, head_dim):
+def init_gqa_params(key, d_in, num_heads, num_kv_groups, head_dim, qk_norm=False):
     kq, kk, kv, ko = jax.random.split(key, 4)
     params = {
         "W_query": jax.device_put(jax.random.normal(kq, (d_in, num_heads * head_dim)) / jnp.sqrt(d_in), device),
@@ -184,9 +185,23 @@ def init_gqa_params(key, d_in, num_heads, num_kv_groups, head_dim):
         "W_value": jax.device_put(jax.random.normal(kv, (d_in, num_kv_groups * head_dim)) / jnp.sqrt(d_in), device),
         "out_proj": jax.device_put(jax.random.normal(ko, (num_heads * head_dim, d_in)) / jnp.sqrt(num_heads * head_dim), device),
     }
+    
+    # Add Q/K normalization if enabled
+    if qk_norm:
+        params["q_norm"] = init_rmsnorm_params(head_dim)
+        params["k_norm"] = init_rmsnorm_params(head_dim)
+    
     return params
 
-def grouped_query_attention_forward(params, x, mask, cos, sin, num_heads, num_kv_groups, head_dim, q_norm=None, k_norm=None):
+@jax.jit
+def apply_qk_norm(x, norm_params):
+    """Apply normalization to Q or K tensors"""
+    b, h, s, d = x.shape
+    x_reshaped = x.reshape(b * h * s, d)
+    x_normed = rmsnorm_forward(norm_params, x_reshaped)
+    return x_normed.reshape(b, h, s, d)
+
+def grouped_query_attention_forward(params, x, mask, cos, sin, num_heads, num_kv_groups, head_dim, qk_norm=False):
     b, seq, d_in = x.shape
     group_size = num_heads // num_kv_groups
 
@@ -194,10 +209,10 @@ def grouped_query_attention_forward(params, x, mask, cos, sin, num_heads, num_kv
     keys = jnp.einsum('bsd,dh->bsh', x, params["W_key"]).reshape(b, seq, num_kv_groups, head_dim).transpose(0,2,1,3)
     values = jnp.einsum('bsd,dh->bsh', x, params["W_value"]).reshape(b, seq, num_kv_groups, head_dim).transpose(0,2,1,3)
 
-    if q_norm is not None:
-        queries = q_norm(queries)
-    if k_norm is not None:
-        keys = k_norm(keys)
+    # Apply Q/K normalization if enabled
+    if qk_norm and "q_norm" in params and "k_norm" in params:
+        queries = apply_qk_norm(queries, params["q_norm"])
+        keys = apply_qk_norm(keys, params["k_norm"])
 
     queries = apply_rope(queries, cos, sin)
     keys = apply_rope(keys, cos, sin)
@@ -217,7 +232,7 @@ def grouped_query_attention_forward(params, x, mask, cos, sin, num_heads, num_kv
 def init_transformer_block_params(key, cfg):
     k_att, k_ff, k_norm1, k_norm2 = jax.random.split(key, 4)
     params = {
-        "att": init_gqa_params(k_att, cfg["emb_dim"], cfg["n_heads"], cfg["n_kv_groups"], cfg["head_dim"]),
+        "att": init_gqa_params(k_att, cfg["emb_dim"], cfg["n_heads"], cfg["n_kv_groups"], cfg["head_dim"], cfg["qk_norm"]),
         "ff": init_feedforward_params(k_ff, cfg["emb_dim"], cfg["hidden_dim"]),
         "norm1": init_rmsnorm_params(cfg["emb_dim"]),
         "norm2": init_rmsnorm_params(cfg["emb_dim"]),
@@ -227,7 +242,11 @@ def init_transformer_block_params(key, cfg):
 def transformer_block_forward(params, x, mask, cos, sin, cfg):
     shortcut = x
     x = rmsnorm_forward(params["norm1"], x)
-    x = grouped_query_attention_forward(params["att"], x, mask, cos, sin, num_heads=cfg["n_heads"], num_kv_groups=cfg["n_kv_groups"], head_dim=cfg["head_dim"], q_norm=None, k_norm=None)
+    x = grouped_query_attention_forward(params["att"], x, mask, cos, sin, 
+                                      num_heads=cfg["n_heads"], 
+                                      num_kv_groups=cfg["n_kv_groups"], 
+                                      head_dim=cfg["head_dim"], 
+                                      qk_norm=cfg["qk_norm"])
     x = x + shortcut
 
     shortcut = x
@@ -303,7 +322,7 @@ def generate(model, idx, max_new_tokens, context_size=None, top_k=1, temperature
     
     return cur_ids
 
-def assign_layer_weights(block_params, converted_weights):
+def assign_layer_weights(block_params, converted_weights, qk_norm=False):
     for key, tensor in converted_weights.items():
         if key == "self_attn.q_proj.weight":
             block_params["att"]["W_query"] = tensor.T
@@ -323,6 +342,13 @@ def assign_layer_weights(block_params, converted_weights):
             block_params["ff"]["fc2"] = tensor.T
         elif key == "mlp.down_proj.weight":
             block_params["ff"]["fc3"] = tensor.T
+        # Handle Q/K norm weights if they exist
+        elif key == "self_attn.q_layernorm.weight" and qk_norm:
+            if "q_norm" in block_params["att"]:
+                block_params["att"]["q_norm"]["scale"] = tensor
+        elif key == "self_attn.k_layernorm.weight" and qk_norm:
+            if "k_norm" in block_params["att"]:
+                block_params["att"]["k_norm"]["scale"] = tensor
 
 def load_and_convert_file_weights(file_path, jax_params, cfg):
     pt_params = load_file(str(file_path))
@@ -341,6 +367,7 @@ def load_and_convert_file_weights(file_path, jax_params, cfg):
             weight_path = ".".join(parts[3:])
             layer_weights[layer_idx][weight_path] = tensor
     
+    # Convert and assign global weights
     if file_weights:
         converted_global = batch_convert_weights(file_weights)
         
@@ -350,18 +377,22 @@ def load_and_convert_file_weights(file_path, jax_params, cfg):
         if "final_norm" in converted_global:
             jax_params["final_norm"]["scale"] = converted_global["final_norm"]
     
+    # Convert and assign layer weights
     for layer_idx, weights in layer_weights.items():
         if layer_idx < len(jax_params["trf_blocks"]):
             converted_layer = batch_convert_weights(weights)
-            assign_layer_weights(jax_params["trf_blocks"][layer_idx], converted_layer)
+            assign_layer_weights(jax_params["trf_blocks"][layer_idx], converted_layer, cfg["qk_norm"])
     
     del pt_params
     cleanup_memory()
 
 def load_qwen3_weights_jax_optimized(param_config, jax_params, safetensors_files):
-    for file_path in safetensors_files:
+    for i, file_path in enumerate(safetensors_files):
+        print(f"Loading file {i+1}/{len(safetensors_files)}: {file_path.name}")
         load_and_convert_file_weights(file_path, jax_params, param_config)
+        cleanup_memory()  # Clean up after each file
     
+    # Set output head to tied embeddings
     if jax_params["tok_emb"] is not None:
         jax_params["out_head"] = jax_params["tok_emb"].T
     
@@ -381,12 +412,14 @@ if __name__ == "__main__":
     else:
         tokenizer = Qwen3Tokenizer(str(tokenizer_path), add_generation_prompt=True)
 
-    # Prepare input
+    # Prepare input - Fixed input processing
     prompt = "how are "
     input_ids = tokenizer.encode(prompt)
     if len(input_ids) > QWEN3_CONFIG["context_length"]:
         input_ids = input_ids[:QWEN3_CONFIG["context_length"]]
-    input_ids = jax.device_put(jnp.array([input_ids]), device)
+    
+    # Convert to JAX array with proper shape (batch_size, seq_len)
+    input_token_ids = jnp.array([input_ids])  # Shape: (1, seq_len)
 
     # Initialize model
     cfg = QWEN3_CONFIG
@@ -396,13 +429,14 @@ if __name__ == "__main__":
     if isinstance(safetensors_files, list) and isinstance(safetensors_files[0], str):
         safetensors_files = [Path(f) for f in safetensors_files]
     
-    # Load weights
+  
     params = load_qwen3_weights_jax_optimized(cfg, params, safetensors_files)
     
+    
     model = {"params": params, "cfg": cfg}
-    input_token_ids = jnp.array([input_ids]) if isinstance(input_ids, list) else input_ids
     
     # Generate text
+  
     output_token_ids = generate(
         model=model, 
         idx=input_token_ids, 
