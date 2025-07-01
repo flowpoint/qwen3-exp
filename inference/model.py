@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import gc
 from collections import defaultdict
+from tqdm import tqdm
 
 try:
     from huggingface_hub import hf_hub_download, snapshot_download
@@ -71,9 +72,9 @@ class Qwen3Tokenizer():
         if add_generation_prompt:
             prompt += "<|im_start|>assistant"
             if not add_thinking:
-                prompt += "\n"
-            else:
                 prompt += "<|think>\n\n<|/think>\n\n"
+            else:
+                prompt += "\n"    
         return prompt
 
 def download_model_from_hf(repo_id, local_dir="./model_cache"):
@@ -122,19 +123,18 @@ def cleanup_memory():
 def init_feedforward_params(key, emb_dim, hidden_dim):
     k1, k2, k3 = jax.random.split(key, 3)
     params = {
-        "fc1": jax.device_put(jax.random.normal(k1, (emb_dim, hidden_dim)) / jnp.sqrt(emb_dim), device),
-        "fc2": jax.device_put(jax.random.normal(k2, (emb_dim, hidden_dim)) / jnp.sqrt(emb_dim), device),
-        "fc3": jax.device_put(jax.random.normal(k3, (hidden_dim, emb_dim)) / jnp.sqrt(hidden_dim), device),
+        "gate_proj": jax.device_put(jax.random.normal(k1, (emb_dim, hidden_dim)) / jnp.sqrt(emb_dim), device),
+        "up_proj": jax.device_put(jax.random.normal(k2, (emb_dim, hidden_dim)) / jnp.sqrt(emb_dim), device),
+        "down_proj": jax.device_put(jax.random.normal(k3, (hidden_dim, emb_dim)) / jnp.sqrt(hidden_dim), device),
     }
     return params
 
 @jax.jit
 def feedforward_forward(params, x):
-    # Fixed: Apply fc1 to input, then fc2 to fc1 output
-    x_fc1 = jnp.einsum('bse,eh->bsh', x, params["fc1"])
-    x_fc2 = jnp.einsum('bsh,he->bse', x_fc1, params["fc2"])  # Use x_fc1, not x
-    x = jax.nn.silu(x_fc1) * x_fc2
-    out = jnp.einsum('bse,eh->bsh', x, params["fc3"])
+    gate = jnp.einsum('bse,eh->bsh', x, params["gate_proj"])
+    gate = jax.nn.silu(gate)
+    up = jnp.einsum('bse,eh->bsh', x, params["up_proj"])
+    out = jnp.einsum('bsh,he->bse', gate * up, params["down_proj"])
     return out
 
 def init_rmsnorm_params(emb_dim, bias=False):
@@ -186,7 +186,6 @@ def init_gqa_params(key, d_in, num_heads, num_kv_groups, head_dim, qk_norm=False
         "out_proj": jax.device_put(jax.random.normal(ko, (num_heads * head_dim, d_in)) / jnp.sqrt(num_heads * head_dim), device),
     }
     
-    # Add Q/K normalization if enabled
     if qk_norm:
         params["q_norm"] = init_rmsnorm_params(head_dim)
         params["k_norm"] = init_rmsnorm_params(head_dim)
@@ -195,7 +194,6 @@ def init_gqa_params(key, d_in, num_heads, num_kv_groups, head_dim, qk_norm=False
 
 @jax.jit
 def apply_qk_norm(x, norm_params):
-    """Apply normalization to Q or K tensors"""
     b, h, s, d = x.shape
     x_reshaped = x.reshape(b * h * s, d)
     x_normed = rmsnorm_forward(norm_params, x_reshaped)
@@ -209,7 +207,6 @@ def grouped_query_attention_forward(params, x, mask, cos, sin, num_heads, num_kv
     keys = jnp.einsum('bsd,dh->bsh', x, params["W_key"]).reshape(b, seq, num_kv_groups, head_dim).transpose(0,2,1,3)
     values = jnp.einsum('bsd,dh->bsh', x, params["W_value"]).reshape(b, seq, num_kv_groups, head_dim).transpose(0,2,1,3)
 
-    # Apply Q/K normalization if enabled
     if qk_norm and "q_norm" in params and "k_norm" in params:
         queries = apply_qk_norm(queries, params["q_norm"])
         keys = apply_qk_norm(keys, params["k_norm"])
@@ -297,28 +294,38 @@ def generate(model, idx, max_new_tokens, context_size=None, top_k=1, temperature
     def compiled_forward(params, x):
         return qwen3_forward(params, x, cfg)
     
-    for i in range(max_new_tokens):
-        idx_cond = cur_ids[:, -context_size:]
-        logits = compiled_forward(params, idx_cond)
-        next_token_logits = logits[:, -1, :]
-        
-        if temperature > 0.0:
-            next_token_logits = next_token_logits / temperature
-            if top_k > 1:
-                top_k_logits, top_k_indices = jax.lax.top_k(next_token_logits[0], top_k)
-                key = jax.random.PRNGKey(i)
-                next_token_idx = jax.random.categorical(key, top_k_logits)
-                next_token = top_k_indices[next_token_idx][None]
+    # Create a proper random key
+    key = jax.random.PRNGKey(42)
+    
+    with tqdm(total=max_new_tokens, desc="Generating tokens") as pbar:
+        for i in range(max_new_tokens):
+            idx_cond = cur_ids[:, -context_size:]
+            logits = compiled_forward(params, idx_cond)
+            next_token_logits = logits[:, -1, :]
+            
+            if temperature > 0.0:
+                next_token_logits = next_token_logits / temperature
+                if top_k > 1:
+                    top_k_logits, top_k_indices = jax.lax.top_k(next_token_logits[0], top_k)
+                    key, subkey = jax.random.split(key)
+                    next_token_idx = jax.random.categorical(subkey, top_k_logits)
+                    next_token = top_k_indices[next_token_idx][None]
+                else:
+                    key, subkey = jax.random.split(key)
+                    next_token = jax.random.categorical(subkey, next_token_logits, axis=-1)
             else:
-                key = jax.random.PRNGKey(i)
-                next_token = jax.random.categorical(key, next_token_logits, axis=-1)
-        else:
-            next_token = jnp.argmax(next_token_logits, axis=-1)
-        
-        cur_ids = jnp.concatenate([cur_ids, next_token[:, None]], axis=1)
-        
-        if eos_id is not None and int(next_token[0]) == eos_id:
-            break
+                next_token = jnp.argmax(next_token_logits, axis=-1)
+            
+            cur_ids = jnp.concatenate([cur_ids, next_token[:, None]], axis=1)
+            
+            pbar.update(1)
+            
+            # Print generated token for debugging
+            if i < 10:  # Print first 10 tokens for debugging
+                print(f"Token {i}: {int(next_token[0])}")
+            
+            if eos_id is not None and int(next_token[0]) == eos_id:
+                break
     
     return cur_ids
 
@@ -337,16 +344,15 @@ def assign_layer_weights(block_params, converted_weights, qk_norm=False):
         elif key == "post_attention_layernorm.weight":
             block_params["norm2"]["scale"] = tensor
         elif key == "mlp.gate_proj.weight":
-            block_params["ff"]["fc1"] = tensor.T
+            block_params["ff"]["gate_proj"] = tensor.T
         elif key == "mlp.up_proj.weight":
-            block_params["ff"]["fc2"] = tensor.T
+            block_params["ff"]["up_proj"] = tensor.T
         elif key == "mlp.down_proj.weight":
-            block_params["ff"]["fc3"] = tensor.T
-        # Handle Q/K norm weights if they exist
-        elif key == "self_attn.q_layernorm.weight" and qk_norm:
+            block_params["ff"]["down_proj"] = tensor.T
+        elif key == "self_attn.q_norm.weight" and qk_norm:
             if "q_norm" in block_params["att"]:
                 block_params["att"]["q_norm"]["scale"] = tensor
-        elif key == "self_attn.k_layernorm.weight" and qk_norm:
+        elif key == "self_attn.k_norm.weight" and qk_norm:
             if "k_norm" in block_params["att"]:
                 block_params["att"]["k_norm"]["scale"] = tensor
 
@@ -361,6 +367,8 @@ def load_and_convert_file_weights(file_path, jax_params, cfg):
             file_weights["tok_emb"] = tensor
         elif key == "model.norm.weight":
             file_weights["final_norm"] = tensor
+        elif key == "lm_head.weight":  # Add this line to load output head weights
+            file_weights["out_head"] = tensor
         elif key.startswith("model.layers."):
             parts = key.split(".")
             layer_idx = int(parts[2])
@@ -376,6 +384,9 @@ def load_and_convert_file_weights(file_path, jax_params, cfg):
             
         if "final_norm" in converted_global:
             jax_params["final_norm"]["scale"] = converted_global["final_norm"]
+            
+        if "out_head" in converted_global:  # Use loaded weights instead of tied embeddings
+            jax_params["out_head"] = converted_global["out_head"].T
     
     # Convert and assign layer weights
     for layer_idx, weights in layer_weights.items():
@@ -390,11 +401,13 @@ def load_qwen3_weights_jax_optimized(param_config, jax_params, safetensors_files
     for i, file_path in enumerate(safetensors_files):
         print(f"Loading file {i+1}/{len(safetensors_files)}: {file_path.name}")
         load_and_convert_file_weights(file_path, jax_params, param_config)
-        cleanup_memory()  # Clean up after each file
+        cleanup_memory()
     
-    # Set output head to tied embeddings
-    if jax_params["tok_emb"] is not None:
-        jax_params["out_head"] = jax_params["tok_emb"].T
+    # Only use tied embeddings if lm_head wasn't loaded
+    if "lm_head.weight" not in [key for file_path in safetensors_files 
+                                for key in load_file(str(file_path)).keys()]:
+        if jax_params["tok_emb"] is not None:
+            jax_params["out_head"] = jax_params["tok_emb"].T
     
     return jax_params
 
@@ -412,14 +425,18 @@ if __name__ == "__main__":
     else:
         tokenizer = Qwen3Tokenizer(str(tokenizer_path), add_generation_prompt=True)
 
-    # Prepare input - Fixed input processing
-    prompt = "how are "
+    # Prepare input - Use a simpler prompt for testing
+    prompt = "What is a large language model?"
     input_ids = tokenizer.encode(prompt)
     if len(input_ids) > QWEN3_CONFIG["context_length"]:
         input_ids = input_ids[:QWEN3_CONFIG["context_length"]]
     
+    print(f"Input prompt: {prompt}")
+    print(f"Input token IDs: {input_ids}")
+    print(f"Decoded input: {tokenizer.decode(input_ids)}")
+    
     # Convert to JAX array with proper shape (batch_size, seq_len)
-    input_token_ids = jnp.array([input_ids])  # Shape: (1, seq_len)
+    input_token_ids = jnp.array([input_ids])
 
     # Initialize model
     cfg = QWEN3_CONFIG
@@ -429,18 +446,34 @@ if __name__ == "__main__":
     if isinstance(safetensors_files, list) and isinstance(safetensors_files[0], str):
         safetensors_files = [Path(f) for f in safetensors_files]
     
-  
     params = load_qwen3_weights_jax_optimized(cfg, params, safetensors_files)
-    
     
     model = {"params": params, "cfg": cfg}
     
-    # Generate text
-  
+    # Test with greedy decoding first
+    print("\n=== Testing with greedy decoding ===")
     output_token_ids = generate(
         model=model, 
         idx=input_token_ids, 
-        max_new_tokens=2,
+        max_new_tokens=20,  # Reduced for testing
+        context_size=QWEN3_CONFIG["context_length"], 
+        top_k=1,
+        temperature=0.0  # Greedy decoding
+    )
+    
+    output_text = tokenizer.decode(list(output_token_ids[0]))
+    print("\n" + "="*50)
+    print("GENERATED TEXT (Greedy):")
+    print("="*50)
+    print(output_text)
+    print("="*50)
+    
+    # Test with sampling
+    print("\n=== Testing with sampling ===")
+    output_token_ids = generate(
+        model=model, 
+        idx=input_token_ids, 
+        max_new_tokens=20,
         context_size=QWEN3_CONFIG["context_length"], 
         top_k=50,
         temperature=0.7
@@ -448,7 +481,7 @@ if __name__ == "__main__":
     
     output_text = tokenizer.decode(list(output_token_ids[0]))
     print("\n" + "="*50)
-    print("GENERATED TEXT:")
+    print("GENERATED TEXT (Sampling):")
     print("="*50)
     print(output_text)
     print("="*50)
