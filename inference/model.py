@@ -2,12 +2,13 @@ import jax
 import jax.numpy as jnp
 from tokenizers import Tokenizer
 import torch
-from safetensors.torch import load_file
+from safetensors.numpy import load_file 
 import os
 from pathlib import Path
 import gc
 from collections import defaultdict
-
+import numpy as np 
+from tqdm import tqdm
 try:
     from huggingface_hub import snapshot_download
 except ImportError:
@@ -54,15 +55,15 @@ def download_model_from_hf(repo_id, local_dir="./model_cache"):
     model_path = snapshot_download(repo_id=repo_id, local_dir=local_dir / repo_id.replace("/", "_"), local_dir_use_symlinks=False)
     return Path(model_path)
 
-def safe_convert_torch_to_jax(torch_tensor):
-    if torch_tensor.is_cuda:
-        torch_tensor = torch_tensor.cpu()
-    if torch_tensor.dtype in [torch.bfloat16, torch.float16]:
-        torch_tensor = torch_tensor.to(torch.float32)
-    return jax.device_put(jnp.array(torch_tensor.detach().numpy()), device)
+def safe_convert_numpy_to_jax(numpy_array):
+    if numpy_array.dtype in [np.float16]:
+        numpy_array = numpy_array.astype(np.float32)
+    return jax.device_put(jnp.array(numpy_array), device)
 
-def batch_convert_weights(torch_weights_dict):
-    return {key: safe_convert_torch_to_jax(tensor) for key, tensor in torch_weights_dict.items()}
+
+def batch_convert_numpy_weights(numpy_weights_dict):
+    return {key: safe_convert_numpy_to_jax(array) for key, array in numpy_weights_dict.items()}
+
 
 def cleanup_memory():
     if torch.cuda.is_available():
@@ -187,7 +188,7 @@ def generate_simple(model, idx, max_new_tokens, context_size, temperature=0.0, t
     cur_ids = jax.device_put(idx, device)
     key = jax.random.PRNGKey(42)
     
-    for i in range(max_new_tokens):
+    for i in tqdm(range(max_new_tokens),desc="Generating tokens"):
         idx_cond = cur_ids[:, -context_size:]
         logits = qwen3_forward_simple(params, idx_cond, cfg)
         next_token_logits = logits[:, -1, :]
@@ -256,7 +257,7 @@ def load_and_convert_file_weights(file_path, jax_params, cfg):
             layer_weights[layer_idx][".".join(parts[3:])] = tensor
     
     if file_weights:
-        converted_global = batch_convert_weights(file_weights)
+        converted_global = batch_convert_numpy_weights(file_weights)
         if "tok_emb" in converted_global:
             jax_params["tok_emb"] = converted_global["tok_emb"]
         if "final_norm" in converted_global:
@@ -266,7 +267,7 @@ def load_and_convert_file_weights(file_path, jax_params, cfg):
     
     for layer_idx, weights in layer_weights.items():
         if layer_idx < len(jax_params["trf_blocks"]):
-            converted_layer = batch_convert_weights(weights)
+            converted_layer = batch_convert_numpy_weights(weights)
             assign_layer_weights(jax_params["trf_blocks"][layer_idx], converted_layer, cfg["qk_norm"])
     
     del pt_params
@@ -311,7 +312,7 @@ if __name__ == "__main__":
     start_time = time.time()
     
     output_token_ids = generate_simple(
-        model=model, idx=input_token_ids, max_new_tokens=5,
+        model=model, idx=input_token_ids, max_new_tokens=50,
         context_size=QWEN3_CONFIG["context_length"], top_k=1,
         temperature=0.0, eos_id=151645
     )
