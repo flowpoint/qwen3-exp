@@ -9,6 +9,7 @@ import gc
 from collections import defaultdict
 import numpy as np 
 from tqdm import tqdm
+from pdb import set_trace
 try:
     from huggingface_hub import snapshot_download
 except ImportError:
@@ -24,8 +25,9 @@ device = jax.devices('gpu')[0] if jax.devices('gpu') else jax.devices('cpu')[0]
 QWEN3_CONFIG = {
     "vocab_size": 151936, "context_length": 40960, "emb_dim": 1024, "n_heads": 16,
     "n_layers": 28, "hidden_dim": 3072, "head_dim": 128, "qk_norm": True,
-    "n_kv_groups": 8, "rope_base": 1000000.0, "dtype": torch.bfloat16,
+    "n_kv_groups": 8, "rope_base": 1000000.0
 }
+cfg = QWEN3_CONFIG
 
 class Qwen3Tokenizer():
     def __init__(self, tokenizer_file_path="tokenizer.json", repo_id=None):
@@ -70,19 +72,18 @@ def cleanup_memory():
         torch.cuda.synchronize()
     gc.collect()
 
-@jax.jit
 def feedforward_forward(params, x):
     gate = jax.nn.silu(jnp.einsum('bse,eh->bsh', x, params["gate_proj"]))
     up = jnp.einsum('bse,eh->bsh', x, params["up_proj"])
     return jnp.einsum('bsh,he->bse', gate * up, params["down_proj"])
 
-@jax.jit
-def rmsnorm_forward(params, x, eps=1e-6):
-    orig_dtype = x.dtype
+def rmsnorm_forward(params, x):
+    eps=1e-6
+    orig_dtype = jax.numpy.float32 #x.dtype
     x = x.astype(jnp.float32)
     variance = jnp.mean(x ** 2, axis=-1, keepdims=True)
     norm_x = x * jax.lax.rsqrt(variance + eps) * params["scale"]
-    return norm_x.astype(orig_dtype)
+    return norm_x.astype(jax.numpy.float32)
 
 def compute_rope_params(head_dim, theta_base=10000.0, context_length=4096):
     inv_freq = 1.0 / (theta_base ** (jnp.arange(0, head_dim, 2) / head_dim))
@@ -91,22 +92,26 @@ def compute_rope_params(head_dim, theta_base=10000.0, context_length=4096):
     return jnp.cos(angles), jnp.sin(angles)
 
 def apply_rope(x, cos, sin):
-    seq_len = x.shape[2]
-    x1, x2 = x[..., :x.shape[-1]//2], x[..., x.shape[-1]//2:]
+    cl = cfg['context_length']
+    vs = cfg['vocab_size']
+    seq_len = cl #x.shape[2]
+    x1, x2 = x[..., :vs//2], x[..., vs//2:]
     cos, sin = cos[:seq_len, :][None, None, :, :], sin[:seq_len, :][None, None, :, :]
     rotated = jnp.concatenate([-x2, x1], axis=-1)
-    return ((x * cos) + (rotated * sin)).astype(x.dtype)
+    return ((x * cos) + (rotated * sin)).astype(jax.numpy.float32)
 
-def apply_rope_with_offset(x, cos, sin, position_offset=0):
+def apply_rope_with_offset(x, cos, sin, position_offset):
+    cl = cfg['context_length']
+    vs = cfg['vocab_size']
     seq_len = x.shape[2]
-    x1, x2 = x[..., :x.shape[-1]//2], x[..., x.shape[-1]//2:]
+    x1, x2 = x[..., :vs//2], x[..., vs//2:]
     
     positions = jnp.arange(position_offset, position_offset + seq_len)
     cos_slice = cos[positions, :][None, None, :, :]
     sin_slice = sin[positions, :][None, None, :, :]
     
     rotated = jnp.concatenate([-x2, x1], axis=-1)
-    return ((x * cos_slice) + (rotated * sin_slice)).astype(x.dtype)
+    return ((x * cos_slice) + (rotated * sin_slice)).astype(jax.numpy.float32)
 
 def apply_qk_norm(x, norm_params):
     b, h, s, d = x.shape
@@ -114,29 +119,41 @@ def apply_qk_norm(x, norm_params):
     x_normed = rmsnorm_forward(norm_params, x_reshaped)
     return x_normed.reshape(b, h, s, d)
 
-def grouped_query_attention_forward_kv(params, x, mask, cos, sin, num_heads, num_kv_groups, head_dim, kv_cache=None, qk_norm=False):
+@jax.jit
+def grouped_query_attention_forward_kv(params, x, cos, sin,  kv_cache):
+    num_heads, num_kv_groups, head_dim = cfg["n_heads"], cfg["n_kv_groups"], cfg["head_dim"]
+    #set_trace()
+
+    cl = cfg['context_length']
+    vs = cfg['vocab_size']
+
+
+    b = 1
+    seq = cl #x.shape[2]
+    d_in = vs
+
     b, seq, d_in = x.shape
+
     group_size = num_heads // num_kv_groups
     
-    if kv_cache is not None and kv_cache["keys"].shape[2] > 0:
-        position_offset = kv_cache["keys"].shape[2]
-    else:
-        position_offset = 0
+    #if kv_cache is not None and kv_cache["keys"].shape[2] > 0:
+    #position_offset = kv_cache["keys"].shape[2]
+    #else:
+    position_offset = 0
     
-    queries = jnp.einsum('bsd,dh->bsh', x, params["W_query"]).reshape(b, seq, num_heads, head_dim).transpose(0,2,1,3)
-    keys = jnp.einsum('bsd,dh->bsh', x, params["W_key"]).reshape(b, seq, num_kv_groups, head_dim).transpose(0,2,1,3)
-    values = jnp.einsum('bsd,dh->bsh', x, params["W_value"]).reshape(b, seq, num_kv_groups, head_dim).transpose(0,2,1,3)
+    queries = jnp.einsum('bsd,dh->bsh', x, params["W_query"]).reshape(b, seq, cfg['n_heads'], cfg['head_dim']).transpose(0,2,1,3)
+    keys = jnp.einsum('bsd,dh->bsh', x, params["W_key"]).reshape(b, seq, cfg['n_kv_groups'], cfg['head_dim']).transpose(0,2,1,3)
+    values = jnp.einsum('bsd,dh->bsh', x, params["W_value"]).reshape(b, seq, cfg['n_kv_groups'], cfg['head_dim']).transpose(0,2,1,3)
 
-    if qk_norm and "q_norm" in params and "k_norm" in params:
-        queries = apply_qk_norm(queries, params["q_norm"])
-        keys = apply_qk_norm(keys, params["k_norm"])
+    queries = apply_qk_norm(queries, params["q_norm"])
+    keys = apply_qk_norm(keys, params["k_norm"])
 
     queries = apply_rope_with_offset(queries, cos, sin, position_offset)
     keys = apply_rope_with_offset(keys, cos, sin, position_offset)
     
-    if kv_cache is not None and kv_cache["keys"].shape[2] > 0:
-        keys = jnp.concatenate([kv_cache["keys"], keys], axis=2)
-        values = jnp.concatenate([kv_cache["values"], values], axis=2)
+    #if kv_cache is not None and kv_cache["keys"].shape[2] > 0:
+    keys = jnp.concatenate([kv_cache["keys"], keys], axis=2)
+    values = jnp.concatenate([kv_cache["values"], values], axis=2)
     
     new_cache = {"keys": keys, "values": values}
     
@@ -145,10 +162,10 @@ def grouped_query_attention_forward_kv(params, x, mask, cos, sin, num_heads, num
     
     attn_scores = jnp.einsum('bnqh,bnkh->bnqk', queries, keys_expanded) / jnp.sqrt(head_dim)
     
-    if kv_cache is None or kv_cache["keys"].shape[2] == 0:
-        q_len, k_len = queries.shape[2], keys.shape[2]
-        causal_mask = jnp.triu(jnp.ones((q_len, k_len)), k=1)
-        attn_scores = jnp.where(causal_mask[None, None, :, :], -jnp.inf, attn_scores)
+    #if kv_cache is None or kv_cache["keys"].shape[2] == 0:
+    q_len, k_len = queries.shape[2], keys.shape[2]
+    causal_mask = jnp.triu(jnp.ones((q_len, k_len)), k=1)
+    attn_scores = jnp.where(causal_mask[None, None, :, :], -jnp.inf, attn_scores)
     
     attn_weights = jax.nn.softmax(attn_scores, axis=-1)
     context = jnp.einsum('bnqk,bnkh->bnqh', attn_weights, values_expanded)
@@ -157,17 +174,18 @@ def grouped_query_attention_forward_kv(params, x, mask, cos, sin, num_heads, num
     
     return output, new_cache
 
-def transformer_block_forward_kv(params, x, mask, cos, sin, cfg, kv_cache=None):
+#@jax.jit
+def transformer_block_forward_kv(params, x, cos, sin, kv_cache):
     shortcut = x
     x = rmsnorm_forward(params["norm1"], x)
-    x, new_cache = grouped_query_attention_forward_kv(params["att"], x, mask, cos, sin, cfg["n_heads"], cfg["n_kv_groups"], cfg["head_dim"], kv_cache, cfg["qk_norm"])
+    x, new_cache = grouped_query_attention_forward_kv(params["att"], x, cos, sin,  kv_cache)
     x = x + shortcut
     shortcut = x
     x = rmsnorm_forward(params["norm2"], x)
     x = feedforward_forward(params["ff"], x)
     return x + shortcut, new_cache
 
-def init_qwen3_params(key, cfg):
+def init_qwen3_params(key):
     k_emb, k_blocks, k_final_norm, k_out = jax.random.split(key, 4)
     tok_emb = jax.random.normal(k_emb, (cfg["vocab_size"], cfg["emb_dim"])) / jnp.sqrt(cfg["vocab_size"])
     block_keys = jax.random.split(k_blocks, cfg["n_layers"])
@@ -184,9 +202,8 @@ def init_qwen3_params(key, cfg):
             "out_proj": jax.random.normal(ko, (cfg["n_heads"] * cfg["head_dim"], cfg["emb_dim"])) / jnp.sqrt(cfg["n_heads"] * cfg["head_dim"]),
         }
         
-        if cfg["qk_norm"]:
-            att_params["q_norm"] = {"scale": jnp.ones((cfg["head_dim"],))}
-            att_params["k_norm"] = {"scale": jnp.ones((cfg["head_dim"],))}
+        att_params["q_norm"] = {"scale": jnp.ones((cfg["head_dim"],))}
+        att_params["k_norm"] = {"scale": jnp.ones((cfg["head_dim"],))}
         
         return {
             "att": att_params,
@@ -208,14 +225,14 @@ def init_qwen3_params(key, cfg):
     
     return jax.tree.map(lambda x: jax.device_put(x, device), params)
 
-def qwen3_forward_kv(params, x, cfg, kv_cache=None):
+def qwen3_forward_kv(params, x, kv_cache):
     x = params["tok_emb"][x]
-    mask = jnp.triu(jnp.ones((cfg["context_length"], cfg["context_length"]), dtype=bool), k=1)
+    #mask = jnp.triu(jnp.ones((cfg["context_length"], cfg["context_length"]), dtype=bool), k=1)
     
     new_cache = []
     for i, block_params in enumerate(params["trf_blocks"]):
-        layer_cache = kv_cache[i] if kv_cache else None
-        x, updated_cache = transformer_block_forward_kv(block_params, x, mask, params["cos"], params["sin"], cfg, layer_cache)
+        layer_cache = kv_cache[i]
+        x, updated_cache = transformer_block_forward_kv(block_params, x, params["cos"], params["sin"], layer_cache)
         new_cache.append(updated_cache)
     
     x = rmsnorm_forward(params["final_norm"], x)
@@ -224,10 +241,11 @@ def qwen3_forward_kv(params, x, cfg, kv_cache=None):
     return logits, new_cache
 
 def generate_kv_optimized(model, idx, max_new_tokens, context_size, temperature=0.7, top_k=50, eos_id=None, batch_size=1):
-    params, cfg = model["params"], model["cfg"]
+    params = model["params"]
+    batch_size = 1
     
     # Keep input on device
-    cur_ids = jnp.array([idx] * batch_size) if batch_size > 1 else jnp.array([idx])
+    cur_ids = jnp.array([idx] * batch_size)
     key = jax.random.PRNGKey(42)
     
     # Initialize KV cache for batch processing
@@ -235,26 +253,20 @@ def generate_kv_optimized(model, idx, max_new_tokens, context_size, temperature=
                  "values": jnp.zeros((batch_size, cfg["n_kv_groups"], 0, cfg["head_dim"]))} 
                 for _ in range(cfg["n_layers"])]
     
-    logits, kv_cache = qwen3_forward_kv(params, cur_ids, cfg, kv_cache)
+    logits, kv_cache = qwen3_forward_kv(params, cur_ids, kv_cache)
     
     for i in tqdm(range(max_new_tokens), desc="Generating"):
         next_token_logits = logits[:, -1, :]
         
-        if top_k is not None and top_k > 0:
-            # Vectorized top_k for batch processing
-            top_k_logits, top_k_indices = jax.lax.top_k(next_token_logits, top_k)
-            mask = jnp.full_like(next_token_logits, -jnp.inf)
-            mask = jnp.take_along_axis(mask, top_k_indices, axis=-1)
-            mask = jnp.where(jnp.arange(mask.shape[-1])[None, :] < top_k, top_k_logits, -jnp.inf)
-            next_token_logits = jnp.full_like(next_token_logits, -jnp.inf)
-            next_token_logits = next_token_logits.at[jnp.arange(batch_size)[:, None], top_k_indices].set(mask)
+        # Vectorized top_k for batch processing
+        top_k_logits, top_k_indices = jax.lax.top_k(next_token_logits, top_k)
+        mask = jnp.full_like(next_token_logits, -jnp.inf)
+        mask = jnp.take_along_axis(mask, top_k_indices, axis=-1)
+        mask = jnp.where(jnp.arange(mask.shape[-1])[None, :] < top_k, top_k_logits, -jnp.inf)
+        next_token_logits = jnp.full_like(next_token_logits, -jnp.inf)
+        next_token_logits = next_token_logits.at[jnp.arange(batch_size)[:, None], top_k_indices].set(mask)
         
-        if temperature > 0.0:
-            next_token_logits = next_token_logits / temperature
-            key, subkey = jax.random.split(key)
-            next_token = jax.random.categorical(subkey, next_token_logits, axis=-1)
-        else:
-            next_token = jnp.argmax(next_token_logits, axis=-1)
+        next_token = jnp.argmax(next_token_logits, axis=-1)
         
         # Check EOS for all sequences in batch - keep on device
         if eos_id is not None and jnp.any(next_token == eos_id):
@@ -263,11 +275,11 @@ def generate_kv_optimized(model, idx, max_new_tokens, context_size, temperature=
         cur_ids = jnp.concatenate([cur_ids, next_token[:, None]], axis=1)
         
         # Process next tokens for entire batch
-        logits, kv_cache = qwen3_forward_kv(params, next_token[:, None], cfg, kv_cache)
+        logits, kv_cache = qwen3_forward_kv(params, next_token[:, None],kv_cache)
     
     return cur_ids
 
-def assign_layer_weights(block_params, converted_weights, qk_norm=False):
+def assign_layer_weights(block_params, converted_weights):
     weight_map = {
         "self_attn.q_proj.weight": ("att", "W_query", True),
         "self_attn.k_proj.weight": ("att", "W_key", True),
@@ -280,11 +292,11 @@ def assign_layer_weights(block_params, converted_weights, qk_norm=False):
         "mlp.down_proj.weight": ("ff", "down_proj", True),
     }
     
-    if qk_norm:
-        weight_map.update({
-            "self_attn.q_norm.weight": ("att", "q_norm", "scale", False),
-            "self_attn.k_norm.weight": ("att", "k_norm", "scale", False),
-        })
+    #if qk_norm:
+    weight_map.update({
+        "self_attn.q_norm.weight": ("att", "q_norm", "scale", False),
+        "self_attn.k_norm.weight": ("att", "k_norm", "scale", False),
+    })
     
     for key, tensor in converted_weights.items():
         if key in weight_map:
@@ -296,7 +308,7 @@ def assign_layer_weights(block_params, converted_weights, qk_norm=False):
                 if subsection in block_params[section]:
                     block_params[section][subsection][param] = tensor.T if transpose else tensor
 
-def load_and_convert_file_weights(file_path, jax_params, cfg):
+def load_and_convert_file_weights(file_path, jax_params):
     pt_params = load_file(str(file_path))
     file_weights, layer_weights = {}, defaultdict(dict)
     
@@ -324,15 +336,15 @@ def load_and_convert_file_weights(file_path, jax_params, cfg):
     for layer_idx, weights in layer_weights.items():
         if layer_idx < len(jax_params["trf_blocks"]):
             converted_layer = batch_convert_numpy_weights(weights)
-            assign_layer_weights(jax_params["trf_blocks"][layer_idx], converted_layer, cfg["qk_norm"])
+            assign_layer_weights(jax_params["trf_blocks"][layer_idx], converted_layer)
     
     del pt_params
     cleanup_memory()
 
-def load_qwen3_weights_jax_optimized(param_config, jax_params, safetensors_files):
+def load_qwen3_weights_jax_optimized(jax_params, safetensors_files):
     for i, file_path in enumerate(safetensors_files):
         print(f"Loading file {i+1}/{len(safetensors_files)}: {file_path.name}")
-        load_and_convert_file_weights(file_path, jax_params, param_config)
+        load_and_convert_file_weights(file_path, jax_params)
         cleanup_memory()
     
     if "lm_head.weight" not in [key for file_path in safetensors_files for key in load_file(str(file_path)).keys()]:
@@ -359,11 +371,10 @@ if __name__ == "__main__":
     # Keep input on device from start
     input_token_ids = jnp.array(input_ids)
     
-    cfg = QWEN3_CONFIG
     key = jax.random.PRNGKey(0)
-    params = init_qwen3_params(key, cfg)
-    params = load_qwen3_weights_jax_optimized(cfg, params, safetensors_files)
-    model = {"params": params, "cfg": cfg}
+    params = init_qwen3_params(key)
+    params = load_qwen3_weights_jax_optimized(params, safetensors_files)
+    model = {"params": params}
     
     import time
     start_time = time.time()
@@ -379,7 +390,7 @@ if __name__ == "__main__":
     
     # Only move to CPU at the very end for decoding
     output_text = tokenizer.decode(list(output_token_ids[0]))
-    print("\n" + "="*50)
+    print("\n" + "="*20)
     print("GENERATED TEXT :")
     print("="*50)
     print(output_text)
