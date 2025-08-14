@@ -140,6 +140,47 @@ def load_and_convert_file_weights(file_path, jax_params, cfg):
     del pt_params
     cleanup_memory()
 
+def init_qwen3_params(key, cfg):
+    k_emb, k_blocks, k_final_norm, k_out = jax.random.split(key, 4)
+    tok_emb = jax.random.normal(k_emb, (cfg["vocab_size"], cfg["emb_dim"])) / jnp.sqrt(cfg["vocab_size"])
+    block_keys = jax.random.split(k_blocks, cfg["n_layers"])
+    
+    def init_block_params(k):
+        k_att, k_ff, k_norm1, k_norm2 = jax.random.split(k, 4)
+        kq, kk, kv, ko = jax.random.split(k_att, 4)
+        k_gate, k_up, k_down = jax.random.split(k_ff, 3)
+        
+        att_params = {
+            "W_query": jax.random.normal(kq, (cfg["emb_dim"], cfg["n_heads"] * cfg["head_dim"])) / jnp.sqrt(cfg["emb_dim"]),
+            "W_key": jax.random.normal(kk, (cfg["emb_dim"], cfg["n_kv_groups"] * cfg["head_dim"])) / jnp.sqrt(cfg["emb_dim"]),
+            "W_value": jax.random.normal(kv, (cfg["emb_dim"], cfg["n_kv_groups"] * cfg["head_dim"])) / jnp.sqrt(cfg["emb_dim"]),
+            "out_proj": jax.random.normal(ko, (cfg["n_heads"] * cfg["head_dim"], cfg["emb_dim"])) / jnp.sqrt(cfg["n_heads"] * cfg["head_dim"]),
+        }
+        
+        if cfg["qk_norm"]:
+            att_params["q_norm"] = {"scale": jnp.ones((cfg["head_dim"],))}
+            att_params["k_norm"] = {"scale": jnp.ones((cfg["head_dim"],))}
+        
+        return {
+            "att": att_params,
+            "ff": {
+                "gate_proj": jax.random.normal(k_gate, (cfg["emb_dim"], cfg["hidden_dim"])) / jnp.sqrt(cfg["emb_dim"]),
+                "up_proj": jax.random.normal(k_up, (cfg["emb_dim"], cfg["hidden_dim"])) / jnp.sqrt(cfg["emb_dim"]),
+                "down_proj": jax.random.normal(k_down, (cfg["hidden_dim"], cfg["emb_dim"])) / jnp.sqrt(cfg["hidden_dim"]),
+            },
+            "norm1": {"scale": jnp.ones((cfg["emb_dim"],))},
+            "norm2": {"scale": jnp.ones((cfg["emb_dim"],))},
+        }
+    
+    trf_blocks = [init_block_params(k) for k in block_keys]
+    final_norm = {"scale": jnp.ones((cfg["emb_dim"],))}
+    out_head = jax.random.normal(k_out, (cfg["emb_dim"], cfg["vocab_size"])) / jnp.sqrt(cfg["emb_dim"])
+    cos, sin = compute_rope_params(cfg["head_dim"], cfg["rope_base"], cfg["context_length"])
+    
+    params = {"tok_emb": tok_emb, "trf_blocks": trf_blocks, "final_norm": final_norm, "out_head": out_head, "cos": cos, "sin": sin}
+    
+    return jax.tree.map(lambda x: jax.device_put(x, device), params)
+
 def load_qwen3_weights_jax_optimized(param_config, jax_params, safetensors_files):
     for i, file_path in enumerate(safetensors_files):
         print(f"Loading file {i+1}/{len(safetensors_files)}: {file_path.name}")
