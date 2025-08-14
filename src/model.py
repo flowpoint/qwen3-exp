@@ -59,14 +59,11 @@ def apply_qk_norm(x, norm_params):
     x_normed = rmsnorm_forward(norm_params, x_reshaped)
     return x_normed.reshape(b, h, s, d)
 
-def grouped_query_attention_forward_kv(params, x, mask, cos, sin, num_heads, num_kv_groups, head_dim, kv_cache=None, qk_norm=False):
+def grouped_query_attention_forward_kv(params, x, mask, cos, sin, num_heads, num_kv_groups, head_dim, kv_cache, qk_norm=False, position_offset=0):
     b, seq, d_in = x.shape
     group_size = num_heads // num_kv_groups
     
-    if kv_cache is not None and kv_cache["keys"].shape[2] > 0:
-        position_offset = kv_cache["keys"].shape[2]
-    else:
-        position_offset = 0
+    assert position_offset == kv_cache["keys"].shape[2], f"{kv_cache['keys'].shape[2]} {position_offset}"
     
     queries = jnp.einsum('bsd,dh->bsh', x, params["W_query"]).reshape(b, seq, num_heads, head_dim).transpose(0,2,1,3)
     keys = jnp.einsum('bsd,dh->bsh', x, params["W_key"]).reshape(b, seq, num_kv_groups, head_dim).transpose(0,2,1,3)
@@ -79,18 +76,18 @@ def grouped_query_attention_forward_kv(params, x, mask, cos, sin, num_heads, num
     queries = apply_rope_with_offset(queries, cos, sin, position_offset)
     keys = apply_rope_with_offset(keys, cos, sin, position_offset)
     
-    if kv_cache is not None and kv_cache["keys"].shape[2] > 0:
-        keys = jnp.concatenate([kv_cache["keys"], keys], axis=2)
-        values = jnp.concatenate([kv_cache["values"], values], axis=2)
+    keys = jnp.concatenate([kv_cache["keys"], keys], axis=2)
+    values = jnp.concatenate([kv_cache["values"], values], axis=2)
     
     new_cache = {"keys": keys, "values": values}
+    position_offset = keys.shape[2]
     
     keys_expanded = jnp.repeat(keys, group_size, axis=1)
     values_expanded = jnp.repeat(values, group_size, axis=1)
     
     attn_scores = jnp.einsum('bnqh,bnkh->bnqk', queries, keys_expanded) / jnp.sqrt(head_dim)
     
-    if kv_cache is None or kv_cache["keys"].shape[2] == 0:
+    if kv_cache["keys"].shape[2] == 0:
         q_len, k_len = queries.shape[2], keys.shape[2]
         causal_mask = jnp.triu(jnp.ones((q_len, k_len)), k=1)
         attn_scores = jnp.where(causal_mask[None, None, :, :], -jnp.inf, attn_scores)
@@ -99,34 +96,34 @@ def grouped_query_attention_forward_kv(params, x, mask, cos, sin, num_heads, num
     context = jnp.einsum('bnqk,bnkh->bnqh', attn_weights, values_expanded)
     context = context.transpose(0,2,1,3).reshape(b, seq, num_heads * head_dim)
     output = jnp.einsum('bsh,hd->bsd', context, params["out_proj"])
-    
-    return output, new_cache
 
-def transformer_block_forward_kv(params, x, mask, cos, sin, cfg, kv_cache=None):
+    return output, new_cache, position_offset
+
+def transformer_block_forward_kv(params, x, mask, cos, sin, cfg, kv_cache, position_offset=0):
     shortcut = x
     x = rmsnorm_forward(params["norm1"], x)
-    x, new_cache = grouped_query_attention_forward_kv(params["att"], x, mask, cos, sin, cfg["n_heads"], cfg["n_kv_groups"], cfg["head_dim"], kv_cache, cfg["qk_norm"])
+    x, new_cache, position_offset = grouped_query_attention_forward_kv(params["att"], x, mask, cos, sin, cfg["n_heads"], cfg["n_kv_groups"], cfg["head_dim"], kv_cache, cfg["qk_norm"],position_offset)
     x = x + shortcut
     shortcut = x
     x = rmsnorm_forward(params["norm2"], x)
     x = feedforward_forward(params["ff"], x)
-    return x + shortcut, new_cache
+    return x + shortcut, new_cache, position_offset
 
 
-def qwen3_forward_kv(params, x, cfg, kv_cache=None):
+def qwen3_forward_kv(params, x, cfg, kv_cache, position_offset_old=0):
     x = params["tok_emb"][x]
     mask = jnp.triu(jnp.ones((cfg["context_length"], cfg["context_length"]), dtype=bool), k=1)
     
     new_cache = []
     for i, block_params in enumerate(params["trf_blocks"]):
-        layer_cache = kv_cache[i] if kv_cache else None
-        x, updated_cache = transformer_block_forward_kv(block_params, x, mask, params["cos"], params["sin"], cfg, layer_cache)
+        layer_cache = kv_cache[i]
+        x, updated_cache, position_offset = transformer_block_forward_kv(block_params, x, mask, params["cos"], params["sin"], cfg, layer_cache, position_offset_old)
         new_cache.append(updated_cache)
     
     x = rmsnorm_forward(params["final_norm"], x)
     logits = jnp.einsum('bse,ev->bsv', x, params["out_head"])
     
-    return logits, new_cache
+    return logits, new_cache, position_offset
 
 def generate_kv_optimized(model, idx, max_new_tokens, context_size, temperature=0.7, top_k=50, eos_id=None, batch_size=1):
     params, cfg = model["params"], model["cfg"]
@@ -139,8 +136,9 @@ def generate_kv_optimized(model, idx, max_new_tokens, context_size, temperature=
     kv_cache = [{"keys": jnp.zeros((batch_size, cfg["n_kv_groups"], 0, cfg["head_dim"])), 
                  "values": jnp.zeros((batch_size, cfg["n_kv_groups"], 0, cfg["head_dim"]))} 
                 for _ in range(cfg["n_layers"])]
+    position_offset = 0
     
-    logits, kv_cache = qwen3_forward_kv(params, cur_ids, cfg, kv_cache)
+    logits, kv_cache, position_offset = qwen3_forward_kv(params, cur_ids, cfg, kv_cache, position_offset)
     
     for i in tqdm(range(max_new_tokens), desc="Generating"):
         next_token_logits = logits[:, -1, :]
@@ -168,6 +166,7 @@ def generate_kv_optimized(model, idx, max_new_tokens, context_size, temperature=
         cur_ids = jnp.concatenate([cur_ids, next_token[:, None]], axis=1)
         
         # Process next tokens for entire batch
-        logits, kv_cache = qwen3_forward_kv(params, next_token[:, None], cfg, kv_cache)
+        logits, kv_cache, position_offset = qwen3_forward_kv(params, next_token[:, None], cfg, kv_cache, position_offset)
+        position_offset += 1
     
     return cur_ids
