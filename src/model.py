@@ -84,7 +84,7 @@ def apply_rope_with_offset(x, cos, sin, position_offset=0):
     seq_len = x.shape[2]
     x1, x2 = x[..., :x.shape[-1]//2], x[..., x.shape[-1]//2:]
     
-    positions = jnp.arange(position_offset, position_offset + seq_len)
+    positions = jnp.arange(0, 0 + seq_len) + position_offset
     cos_slice = cos[positions, :][None, None, :, :]
     sin_slice = sin[positions, :][None, None, :, :]
     
@@ -188,10 +188,17 @@ def rms2(norm1, x):
 def transformer_block_forward_kv(params, mask, cos, sin, kv_cache, position_offset, x):
     shortcut = x
     x = rmsnorm_forward(params["norm1"], x)
-    if x.shape[2] == 1:
-        x, new_cache, position_offset = grouped_query_attention_forward_kv(cfg["n_heads"], cfg["n_kv_groups"], cfg["head_dim"], cos, sin, params["att"], mask,  kv_cache, cfg["qk_norm"], position_offset, x)
-    else:
-        x, new_cache, position_offset = grouped_query_attention_forward_kv_pre(cfg["n_heads"], cfg["n_kv_groups"], cfg["head_dim"], cos, sin, params["att"], mask,  kv_cache, cfg["qk_norm"], position_offset, x)
+    x, new_cache, position_offset = grouped_query_attention_forward_kv(cfg["n_heads"], cfg["n_kv_groups"], cfg["head_dim"], cos, sin, params["att"], mask,  kv_cache, cfg["qk_norm"], position_offset, x)
+    x = x + shortcut
+    shortcut = x
+    x = rmsnorm_forward(params["norm2"], x)
+    x = feedforward_forward(params["ff"], x)
+    return x + shortcut, new_cache, position_offset
+
+def transformer_block_forward_kv_pre(params, mask, cos, sin, kv_cache, position_offset, x):
+    shortcut = x
+    x = rmsnorm_forward(params["norm1"], x)
+    x, new_cache, position_offset = grouped_query_attention_forward_kv_pre(cfg["n_heads"], cfg["n_kv_groups"], cfg["head_dim"], cos, sin, params["att"], mask,  kv_cache, cfg["qk_norm"], position_offset, x)
     x = x + shortcut
     shortcut = x
     x = rmsnorm_forward(params["norm2"], x)
@@ -213,6 +220,23 @@ def qwen3_forward_kv(params, x, cfg, kv_cache, position_offset):
     logits = jnp.einsum('bse,ev->bsv', x, params["out_head"])
     
     return logits, new_cache, position_offset_new
+
+def qwen3_forward_kv_pre(params, x, cfg, kv_cache, position_offset):
+    x = params["tok_emb"][x]
+    mask = jnp.triu(jnp.ones((cfg["context_length"], cfg["context_length"]), dtype=bool), k=1)
+    
+    new_cache = []
+    for i, block_params in enumerate(params["trf_blocks"]):
+        layer_cache = kv_cache[i]
+        x, updated_cache, position_offset_new = transformer_block_forward_kv_pre(block_params, mask, params["cos"], params["sin"], layer_cache, position_offset, x)
+        new_cache.append(updated_cache)
+    
+    x = rmsnorm_forward(params["final_norm"], x)
+    logits = jnp.einsum('bse,ev->bsv', x, params["out_head"])
+    
+    return logits, new_cache, position_offset_new
+
+
 
 
 def steptop(params, cfg):
@@ -251,14 +275,17 @@ def generate_kv_optimized(model, idx, max_new_tokens, context_size, temperature=
                 for _ in range(cfg["n_layers"])]
     position_offset = 0
     
-    logits, kv_cache, position_offset = qwen3_forward_kv(params, cur_ids, cfg, kv_cache, position_offset)
+    logits, kv_cache, position_offset = qwen3_forward_kv_pre(params, cur_ids, cfg, kv_cache, position_offset)
 
     f = steptop(params, cfg)
-    #logits, kv_cache, position_offset, cur_ids = jax.lax.scan(f, init=[logits, kv_cache, position_offset, cur_ids], length=max_new_tokens)()
+    logits, kv_cache, position_offset, cur_ids = jax.lax.scan(
+            f, 
+            init=[logits, kv_cache, position_offset, cur_ids], length=max_new_tokens
+            )()
 
 
-    for i in tqdm(range(max_new_tokens), desc="Generating"):
-        [logits, kv_cache, position_offset, cur_ids], _ = f([logits, kv_cache, position_offset, cur_ids], None)
+    #for i in tqdm(range(max_new_tokens), desc="Generating"):
+    #    [logits, kv_cache, position_offset, cur_ids], _ = f([logits, kv_cache, position_offset, cur_ids], None)
 
     
     '''
