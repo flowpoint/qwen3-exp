@@ -21,9 +21,16 @@ def feedforward_forward(params, x):
     up = jnp.einsum('bse,eh->bsh', x, params["up_proj"])
     return jnp.einsum('bsh,he->bse', gate * up, params["down_proj"])
 
+dtype = jax.dtypes.bfloat16
+cfg = {
+    "vocab_size": 151936, "context_length": 40960, "emb_dim": 1024, "n_heads": 16,
+    "n_layers": 28, "hidden_dim": 3072, "head_dim": 128, "qk_norm": True,
+    "n_kv_groups": 8, "rope_base": 1000000.0, "dtype": 'bfloat16', #torch.bfloat16,
+}
+
 @jax.jit
 def rmsnorm_forward(params, x, eps=1e-6):
-    orig_dtype = x.dtype
+    orig_dtype = dtype
     x = x.astype(jnp.float32)
     variance = jnp.mean(x ** 2, axis=-1, keepdims=True)
     norm_x = x * jax.lax.rsqrt(variance + eps) * params["scale"]
@@ -40,7 +47,7 @@ def apply_rope(x, cos, sin):
     x1, x2 = x[..., :x.shape[-1]//2], x[..., x.shape[-1]//2:]
     cos, sin = cos[:seq_len, :][None, None, :, :], sin[:seq_len, :][None, None, :, :]
     rotated = jnp.concatenate([-x2, x1], axis=-1)
-    return ((x * cos) + (rotated * sin)).astype(x.dtype)
+    return ((x * cos) + (rotated * sin)).astype(dtype)
 
 def apply_rope_with_offset(x, cos, sin, position_offset=0):
     seq_len = x.shape[2]
@@ -51,7 +58,7 @@ def apply_rope_with_offset(x, cos, sin, position_offset=0):
     sin_slice = sin[positions, :][None, None, :, :]
     
     rotated = jnp.concatenate([-x2, x1], axis=-1)
-    return ((x * cos_slice) + (rotated * sin_slice)).astype(x.dtype)
+    return ((x * cos_slice) + (rotated * sin_slice)).astype(dtype)
 
 def apply_qk_norm(x, norm_params):
     b, h, s, d = x.shape
@@ -59,11 +66,12 @@ def apply_qk_norm(x, norm_params):
     x_normed = rmsnorm_forward(norm_params, x_reshaped)
     return x_normed.reshape(b, h, s, d)
 
-def grouped_query_attention_forward_kv(params, x, mask, cos, sin, num_heads, num_kv_groups, head_dim, kv_cache, qk_norm=False, position_offset=0):
+#@jax.jit
+def grouped_query_attention_forward_kv(num_heads, num_kv_groups, head_dim, cos, sin, params, x, mask,  kv_cache, qk_norm=False, position_offset=0):
     b, seq, d_in = x.shape
     group_size = num_heads // num_kv_groups
     
-    assert position_offset == kv_cache["keys"].shape[2], f"{kv_cache['keys'].shape[2]} {position_offset}"
+    #assert position_offset == kv_cache["keys"].shape[2], f"{kv_cache['keys'].shape[2]} {position_offset}"
     
     queries = jnp.einsum('bsd,dh->bsh', x, params["W_query"]).reshape(b, seq, num_heads, head_dim).transpose(0,2,1,3)
     keys = jnp.einsum('bsd,dh->bsh', x, params["W_key"]).reshape(b, seq, num_kv_groups, head_dim).transpose(0,2,1,3)
@@ -76,18 +84,19 @@ def grouped_query_attention_forward_kv(params, x, mask, cos, sin, num_heads, num
     queries = apply_rope_with_offset(queries, cos, sin, position_offset)
     keys = apply_rope_with_offset(keys, cos, sin, position_offset)
     
-    keys = jnp.concatenate([kv_cache["keys"], keys], axis=2)
-    values = jnp.concatenate([kv_cache["values"], values], axis=2)
+    keys = jnp.concatenate([kv_cache["keys"][:,:, :position_offset], keys], axis=2)
+    values = jnp.concatenate([kv_cache["values"][:,:,:position_offset], values], axis=2)
     
     new_cache = {"keys": keys, "values": values}
-    position_offset = keys.shape[2]
+    position_offset_new = keys.shape[2]
     
     keys_expanded = jnp.repeat(keys, group_size, axis=1)
     values_expanded = jnp.repeat(values, group_size, axis=1)
     
     attn_scores = jnp.einsum('bnqh,bnkh->bnqk', queries, keys_expanded) / jnp.sqrt(head_dim)
     
-    if kv_cache["keys"].shape[2] == 0:
+    #if kv_cache["keys"].shape[2] == 0:
+    if position_offset == 0:
         q_len, k_len = queries.shape[2], keys.shape[2]
         causal_mask = jnp.triu(jnp.ones((q_len, k_len)), k=1)
         attn_scores = jnp.where(causal_mask[None, None, :, :], -jnp.inf, attn_scores)
@@ -97,12 +106,12 @@ def grouped_query_attention_forward_kv(params, x, mask, cos, sin, num_heads, num
     context = context.transpose(0,2,1,3).reshape(b, seq, num_heads * head_dim)
     output = jnp.einsum('bsh,hd->bsd', context, params["out_proj"])
 
-    return output, new_cache, position_offset
+    return output, new_cache, position_offset_new
 
-def transformer_block_forward_kv(params, x, mask, cos, sin, cfg, kv_cache, position_offset=0):
+def transformer_block_forward_kv(params, x, mask, cos, sin, kv_cache, position_offset=0):
     shortcut = x
     x = rmsnorm_forward(params["norm1"], x)
-    x, new_cache, position_offset = grouped_query_attention_forward_kv(params["att"], x, mask, cos, sin, cfg["n_heads"], cfg["n_kv_groups"], cfg["head_dim"], kv_cache, cfg["qk_norm"],position_offset)
+    x, new_cache, position_offset = grouped_query_attention_forward_kv(cfg["n_heads"], cfg["n_kv_groups"], cfg["head_dim"], cos, sin, params["att"], x, mask,  kv_cache, cfg["qk_norm"],position_offset)
     x = x + shortcut
     shortcut = x
     x = rmsnorm_forward(params["norm2"], x)
@@ -117,7 +126,7 @@ def qwen3_forward_kv(params, x, cfg, kv_cache, position_offset_old=0):
     new_cache = []
     for i, block_params in enumerate(params["trf_blocks"]):
         layer_cache = kv_cache[i]
-        x, updated_cache, position_offset = transformer_block_forward_kv(block_params, x, mask, params["cos"], params["sin"], cfg, layer_cache, position_offset_old)
+        x, updated_cache, position_offset = transformer_block_forward_kv(block_params, x, mask, params["cos"], params["sin"], layer_cache, position_offset_old)
         new_cache.append(updated_cache)
     
     x = rmsnorm_forward(params["final_norm"], x)
@@ -127,6 +136,7 @@ def qwen3_forward_kv(params, x, cfg, kv_cache, position_offset_old=0):
 
 def generate_kv_optimized(model, idx, max_new_tokens, context_size, temperature=0.7, top_k=50, eos_id=None, batch_size=1):
     params, cfg = model["params"], model["cfg"]
+    cfg.pop('dtype')
     
     # Keep input on device
     cur_ids = jnp.array([idx] * batch_size) if batch_size > 1 else jnp.array([idx])
@@ -167,6 +177,5 @@ def generate_kv_optimized(model, idx, max_new_tokens, context_size, temperature=
         
         # Process next tokens for entire batch
         logits, kv_cache, position_offset = qwen3_forward_kv(params, next_token[:, None], cfg, kv_cache, position_offset)
-        position_offset += 1
     
     return cur_ids

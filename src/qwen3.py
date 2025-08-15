@@ -31,7 +31,7 @@ else:
 QWEN3_CONFIG = {
     "vocab_size": 151936, "context_length": 40960, "emb_dim": 1024, "n_heads": 16,
     "n_layers": 28, "hidden_dim": 3072, "head_dim": 128, "qk_norm": True,
-    "n_kv_groups": 8, "rope_base": 1000000.0, "dtype": torch.bfloat16,
+    "n_kv_groups": 8, "rope_base": 1000000.0, "dtype": 'bfloat16', #torch.bfloat16,
 }
 
 class Qwen3Tokenizer():
