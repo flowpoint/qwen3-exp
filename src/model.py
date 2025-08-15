@@ -139,7 +139,7 @@ def grouped_query_attention_forward_kv_pre(num_heads, num_kv_groups, head_dim, c
 
     return output, new_cache, position_offset_new
 
-@partial(jax.jit, static_argnums=[0,1,2,3,4, 6, 8])
+#@partial(jax.jit, static_argnums=[0,1,2,3,4, 6, 8])
 def grouped_query_attention_forward_kv(num_heads, num_kv_groups, head_dim, cos, sin, params, mask,  kv_cache, qk_norm, position_offset, x):
     b, seq, d_in = x.shape
     group_size = num_heads // num_kv_groups
@@ -157,11 +157,20 @@ def grouped_query_attention_forward_kv(num_heads, num_kv_groups, head_dim, cos, 
     queries = apply_rope_with_offset(queries, cos, sin, position_offset)
     keys = apply_rope_with_offset(keys, cos, sin, position_offset)
     
-    keys = jnp.concatenate([kv_cache["keys"][:,:, :position_offset], keys], axis=2)
-    values = jnp.concatenate([kv_cache["values"][:,:,:position_offset], values], axis=2)
+    #keys = jnp.concatenate([kv_cache["keys"][:,:, :position_offset], keys], axis=2)
+    #values = jnp.concatenate([kv_cache["values"][:,:,:position_offset], values], axis=2)
+
+    #keys = jnp.concatenate([jax.lax.dynamic_slice_in_dim(kv_cache["keys"], 0, position_offset, axis=2), keys], axis=2)
+    #values = jnp.concatenate([jax.lax.dynamic_slice_in_dim(kv_cache["values"], 0, position_offset, axis=2), values], axis=2)
     
-    kv_cache["keys"] = kv_cache["keys"].at[:,:,:keys.shape[2]].set(keys)
-    kv_cache["values"] = kv_cache["values"].at[:,:,:values.shape[2]].set(values)
+    kv_cache["keys"] = kv_cache["keys"].at[:,:,position_offset:position_offset + keys.shape[2]].set(keys)
+    kv_cache["values"] = kv_cache["values"].at[:,:,position_offset:position_offset + values.shape[2]].set(values)
+
+    keys = kv_cache["keys"][:, :, :position_offset+keys.shape[2]]
+    values = kv_cache["values"][:, :, :position_offset+values.shape[2]]
+
+    #kv_cache["values"] = kv_cache["values"].at[:,:,:values.shape[2]].set(values)
+
     new_cache = kv_cache
     position_offset_new = keys.shape[2]
     
@@ -278,14 +287,16 @@ def generate_kv_optimized(model, idx, max_new_tokens, context_size, temperature=
     logits, kv_cache, position_offset = qwen3_forward_kv_pre(params, cur_ids, cfg, kv_cache, position_offset)
 
     f = steptop(params, cfg)
+    '''
     logits, kv_cache, position_offset, cur_ids = jax.lax.scan(
             f, 
             init=[logits, kv_cache, position_offset, cur_ids], length=max_new_tokens
             )()
+    '''
 
 
-    #for i in tqdm(range(max_new_tokens), desc="Generating"):
-    #    [logits, kv_cache, position_offset, cur_ids], _ = f([logits, kv_cache, position_offset, cur_ids], None)
+    for i in tqdm(range(max_new_tokens), desc="Generating"):
+        [logits, kv_cache, position_offset, cur_ids], _ = f([logits, kv_cache, position_offset, cur_ids], None)
 
     
     '''
