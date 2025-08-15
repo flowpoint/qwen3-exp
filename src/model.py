@@ -139,8 +139,8 @@ def grouped_query_attention_forward_kv_pre(num_heads, num_kv_groups, head_dim, c
 
     return output, new_cache, position_offset_new
 
-#@partial(jax.jit, static_argnums=[0,1,2,3,4, 6, 8])
-def grouped_query_attention_forward_kv(num_heads, num_kv_groups, head_dim, cos, sin, params, mask,  kv_cache, qk_norm, position_offset, x):
+@partial(jax.jit, static_argnums=[0,1,2, 7])
+def grouped_query_attention_forward_kv(num_heads, num_kv_groups, head_dim, cos, sin, params, kv_cache, qk_norm, position_offset, x):
     b, seq, d_in = x.shape
     group_size = num_heads // num_kv_groups
     
@@ -156,12 +156,6 @@ def grouped_query_attention_forward_kv(num_heads, num_kv_groups, head_dim, cos, 
 
     queries = apply_rope_with_offset(queries, cos, sin, position_offset)
     keys = apply_rope_with_offset(keys, cos, sin, position_offset)
-    
-    #keys = jnp.concatenate([kv_cache["keys"][:,:, :position_offset], keys], axis=2)
-    #values = jnp.concatenate([kv_cache["values"][:,:,:position_offset], values], axis=2)
-
-    #keys = jnp.concatenate([jax.lax.dynamic_slice_in_dim(kv_cache["keys"], 0, position_offset, axis=2), keys], axis=2)
-    #values = jnp.concatenate([jax.lax.dynamic_slice_in_dim(kv_cache["values"], 0, position_offset, axis=2), values], axis=2)
     
     kv_cache["keys"] = kv_cache["keys"].at[:,:,position_offset:position_offset + keys.shape[2]].set(keys)
     kv_cache["values"] = kv_cache["values"].at[:,:,position_offset:position_offset + values.shape[2]].set(values)
@@ -179,11 +173,6 @@ def grouped_query_attention_forward_kv(num_heads, num_kv_groups, head_dim, cos, 
     
     attn_scores = jnp.einsum('bnqh,bnkh->bnqk', queries, keys_expanded) / jnp.sqrt(head_dim)
     
-    if position_offset == 0:
-        q_len, k_len = queries.shape[2], keys.shape[2]
-        causal_mask = jnp.triu(jnp.ones((q_len, k_len)), k=1)
-        attn_scores = jnp.where(causal_mask[None, None, :, :], -jnp.inf, attn_scores)
-    
     attn_weights = jax.nn.softmax(attn_scores, axis=-1)
     context = jnp.einsum('bnqk,bnkh->bnqh', attn_weights, values_expanded)
     context = context.transpose(0,2,1,3).reshape(b, seq, num_heads * head_dim)
@@ -197,7 +186,7 @@ def rms2(norm1, x):
 def transformer_block_forward_kv(params, mask, cos, sin, kv_cache, position_offset, x):
     shortcut = x
     x = rmsnorm_forward(params["norm1"], x)
-    x, new_cache, position_offset = grouped_query_attention_forward_kv(cfg["n_heads"], cfg["n_kv_groups"], cfg["head_dim"], cos, sin, params["att"], mask,  kv_cache, cfg["qk_norm"], position_offset, x)
+    x, new_cache, position_offset = grouped_query_attention_forward_kv(cfg["n_heads"], cfg["n_kv_groups"], cfg["head_dim"], cos, sin, params["att"], kv_cache, cfg["qk_norm"], position_offset, x)
     x = x + shortcut
     shortcut = x
     x = rmsnorm_forward(params["norm2"], x)
