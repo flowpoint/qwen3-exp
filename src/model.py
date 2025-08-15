@@ -140,7 +140,7 @@ def grouped_query_attention_forward_kv_pre(num_heads, num_kv_groups, head_dim, c
 
     return output, new_cache, position_offset_new
 
-@partial(jax.jit, static_argnums=[0,1,2,7,])
+#@partial(jax.jit, static_argnums=[0,1,2,7,])
 def grouped_query_attention_forward_kv(num_heads, num_kv_groups, head_dim, cos, sin, params, kv_cache, qk_norm, position_offset, x):
     b, seq, d_in = x.shape
     print(x.shape)
@@ -265,7 +265,7 @@ def steptop(params, cfg):
         
         # Process next tokens for entire batch
         logits, kv_cache, position_offset = qwen3_forward_kv(params, next_token[:, None], cfg, kv_cache, position_offset)
-        return [logits, kv_cache, position_offset, cur_ids], None
+        return [logits, kv_cache, position_offset, cur_ids[:,1:]], None
     return step
 
 
@@ -288,16 +288,17 @@ def generate_kv_optimized(model, idx, max_new_tokens, context_size, temperature=
     logits, kv_cache, position_offset = qwen3_forward_kv_pre(params, cur_ids, cfg, kv_cache, position_offset)
 
     f = steptop(params, cfg)
-    '''
-    logits, kv_cache, position_offset, cur_ids = jax.lax.scan(
-            f, 
-            init=[logits, kv_cache, position_offset, cur_ids], length=max_new_tokens
-            )()
-    '''
+    [logits, kv_cache, position_offset, cur_ids], _ = f([logits, kv_cache, position_offset, cur_ids], None)
 
-
-    for i in tqdm(range(max_new_tokens), desc="Generating"):
-        [logits, kv_cache, position_offset, cur_ids], _ = f([logits, kv_cache, position_offset, cur_ids], None)
+    use_lax = True
+    if use_lax:
+        [logits, kv_cache, position_offset, cur_ids], _ = jax.lax.scan(
+                f, 
+                init=[logits, kv_cache, position_offset, cur_ids], length=max_new_tokens
+                )
+    else:
+        for i in tqdm(range(max_new_tokens), desc="Generating"):
+            [logits, kv_cache, position_offset, cur_ids], _ = f([logits, kv_cache, position_offset, cur_ids], None)
 
     
     '''
