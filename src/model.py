@@ -139,12 +139,10 @@ def grouped_query_attention_forward_kv_pre(num_heads, num_kv_groups, head_dim, c
 
     return output, new_cache, position_offset_new
 
-@partial(jax.jit, static_argnums=[0,1,2, 7])
+#@partial(jax.jit, static_argnums=[0,1,2, 7])
 def grouped_query_attention_forward_kv(num_heads, num_kv_groups, head_dim, cos, sin, params, kv_cache, qk_norm, position_offset, x):
     b, seq, d_in = x.shape
     group_size = num_heads // num_kv_groups
-    
-    #assert position_offset == kv_cache["keys"].shape[2], f"{kv_cache['keys'].shape[2]} {position_offset}"
     
     queries = jnp.einsum('bsd,dh->bsh', x, params["W_query"]).reshape(b, seq, num_heads, head_dim).transpose(0,2,1,3)
     keys = jnp.einsum('bsd,dh->bsh', x, params["W_key"]).reshape(b, seq, num_kv_groups, head_dim).transpose(0,2,1,3)
@@ -157,16 +155,17 @@ def grouped_query_attention_forward_kv(num_heads, num_kv_groups, head_dim, cos, 
     queries = apply_rope_with_offset(queries, cos, sin, position_offset)
     keys = apply_rope_with_offset(keys, cos, sin, position_offset)
     
-    kv_cache["keys"] = kv_cache["keys"].at[:,:,position_offset:position_offset + keys.shape[2]].set(keys)
-    kv_cache["values"] = kv_cache["values"].at[:,:,position_offset:position_offset + values.shape[2]].set(values)
+    kv_cache["keys"] = kv_cache["keys"].at[:,:,position_offset:position_offset + 1].set(keys)
+    #kv_cache["keys"] = jax.lax.dynamic_slice_in_dim(kv_cache["keys"],position_offset, position_offset + 1, axis=2).set(keys)
+    #keys = jnp.concatenate([jax.lax.dynamic_slice_in_dim(kv_cache["keys"], 0, position_offset, axis=2), keys], axis=2)
+    kv_cache["values"] = kv_cache["values"].at[:,:,position_offset:position_offset + 1].set(values)
+    #kv_cache["values"] = jax.lax.dynamic_slice_in_dim(kv_cache["values"],position_offset, position_offset + 1, axis=2).set(values)
 
-    keys = kv_cache["keys"][:, :, :position_offset+keys.shape[2]]
-    values = kv_cache["values"][:, :, :position_offset+values.shape[2]]
-
-    #kv_cache["values"] = kv_cache["values"].at[:,:,:values.shape[2]].set(values)
+    keys = kv_cache["keys"][:, :, :position_offset+1]
+    values = kv_cache["values"][:, :, :position_offset+1]
 
     new_cache = kv_cache
-    position_offset_new = keys.shape[2]
+    position_offset_new = position_offset + 1 #keys.shape[2]
     
     keys_expanded = jnp.repeat(keys, group_size, axis=1)
     values_expanded = jnp.repeat(values, group_size, axis=1)
