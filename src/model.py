@@ -23,7 +23,8 @@ def feedforward_forward(params, x):
     up = jnp.einsum('bse,eh->bsh', x, params["up_proj"])
     return jnp.einsum('bsh,he->bse', gate * up, params["down_proj"])
 
-dtype = jax.dtypes.bfloat16
+#dtype = jax.dtypes.bfloat16
+dtype = jnp.float32
 cfg = {
     "vocab_size": 151936, "context_length": 40960, "emb_dim": 1024, "n_heads": 16,
     "n_layers": 28, "hidden_dim": 3072, "head_dim": 128, "qk_norm": True,
@@ -139,9 +140,10 @@ def grouped_query_attention_forward_kv_pre(num_heads, num_kv_groups, head_dim, c
 
     return output, new_cache, position_offset_new
 
-#@partial(jax.jit, static_argnums=[0,1,2, 7])
+@partial(jax.jit, static_argnums=[0,1,2,7,])
 def grouped_query_attention_forward_kv(num_heads, num_kv_groups, head_dim, cos, sin, params, kv_cache, qk_norm, position_offset, x):
     b, seq, d_in = x.shape
+    print(x.shape)
     group_size = num_heads // num_kv_groups
     
     queries = jnp.einsum('bsd,dh->bsh', x, params["W_query"]).reshape(b, seq, num_heads, head_dim).transpose(0,2,1,3)
@@ -155,22 +157,33 @@ def grouped_query_attention_forward_kv(num_heads, num_kv_groups, head_dim, cos, 
     queries = apply_rope_with_offset(queries, cos, sin, position_offset)
     keys = apply_rope_with_offset(keys, cos, sin, position_offset)
     
-    kv_cache["keys"] = kv_cache["keys"].at[:,:,position_offset:position_offset + 1].set(keys)
+    #kv_cache["keys"] = kv_cache["keys"].at[:,:,position_offset:position_offset + 1].set(keys)
+    kv_cache['keys'] = jax.lax.dynamic_update_slice_in_dim(kv_cache['keys'], keys, start_index=position_offset, axis=2) 
+    kv_cache['values'] = jax.lax.dynamic_update_slice_in_dim(kv_cache['values'], values, start_index=position_offset, axis=2)
+
     #kv_cache["keys"] = jax.lax.dynamic_slice_in_dim(kv_cache["keys"],position_offset, position_offset + 1, axis=2).set(keys)
     #keys = jnp.concatenate([jax.lax.dynamic_slice_in_dim(kv_cache["keys"], 0, position_offset, axis=2), keys], axis=2)
-    kv_cache["values"] = kv_cache["values"].at[:,:,position_offset:position_offset + 1].set(values)
+    #kv_cache["values"] = kv_cache["values"].at[:,:,position_offset:position_offset + 1].set(values)
     #kv_cache["values"] = jax.lax.dynamic_slice_in_dim(kv_cache["values"],position_offset, position_offset + 1, axis=2).set(values)
 
-    keys = kv_cache["keys"][:, :, :position_offset+1]
-    values = kv_cache["values"][:, :, :position_offset+1]
+    #keys = kv_cache["keys"][:, :, :position_offset+1]
+    #values = kv_cache["values"][:, :, :position_offset+1]
+
+    #keys = jax.lax.dynamic_slice_in_dim(kv_cache["keys"], 0, position_offset+1, axis=2)
+    #values = jax.lax.dynamic_slice_in_dim(kv_cache["values"], 0, position_offset+1, axis=2)
+    keys = kv_cache['keys']
+    values = kv_cache['values']
 
     new_cache = kv_cache
-    position_offset_new = position_offset + 1 #keys.shape[2]
+    position_offset_new = position_offset + 1
+
+    mask = np.arange(keys.shape[2]) > position_offset + 1
     
     keys_expanded = jnp.repeat(keys, group_size, axis=1)
     values_expanded = jnp.repeat(values, group_size, axis=1)
     
     attn_scores = jnp.einsum('bnqh,bnkh->bnqk', queries, keys_expanded) / jnp.sqrt(head_dim)
+    attn_scores = jnp.where(mask, -jnp.float_('inf'), attn_scores)
     
     attn_weights = jax.nn.softmax(attn_scores, axis=-1)
     context = jnp.einsum('bnqk,bnkh->bnqh', attn_weights, values_expanded)
