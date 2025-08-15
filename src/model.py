@@ -10,6 +10,8 @@ from collections import defaultdict
 import numpy as np 
 from tqdm import tqdm
 
+from functools import partial
+
 if jax.default_backend() == 'gpu':
     device =  jax.devices('gpu')[0]
 else:
@@ -49,6 +51,24 @@ def apply_rope(x, cos, sin):
     rotated = jnp.concatenate([-x2, x1], axis=-1)
     return ((x * cos) + (rotated * sin)).astype(dtype)
 
+#@jax.jit
+'''
+def apply_rope_with_offset(x, cos, sin, position_offset=0):
+    #seq_len = x.shape[2]
+    os = x.shape[2]
+    xs = x.shape
+    seq_len = cfg['context_length']
+
+    x = jnp.resize(x, (xs[0], xs[1], seq_len,xs [-1]))
+    x1, x2 = x[..., :x.shape[-1]//2], x[..., x.shape[-1]//2:]
+    
+    positions = jnp.arange(position_offset, position_offset + seq_len)
+    cos_slice = cos[positions, :][None, None, :, :]
+    sin_slice = sin[positions, :][None, None, :, :]
+    
+    rotated = jnp.concatenate([-x2, x1], axis=-1)
+    return ((x * cos_slice) + (rotated * sin_slice)).astype(dtype)[:,:,:os,:]
+'''
 def apply_rope_with_offset(x, cos, sin, position_offset=0):
     seq_len = x.shape[2]
     x1, x2 = x[..., :x.shape[-1]//2], x[..., x.shape[-1]//2:]
@@ -66,7 +86,7 @@ def apply_qk_norm(x, norm_params):
     x_normed = rmsnorm_forward(norm_params, x_reshaped)
     return x_normed.reshape(b, h, s, d)
 
-#@jax.jit
+#@partial(jax.jit, static_argnums=[0,1,2,8])
 def grouped_query_attention_forward_kv(num_heads, num_kv_groups, head_dim, cos, sin, params, mask,  kv_cache, qk_norm, position_offset, x):
     b, seq, d_in = x.shape
     group_size = num_heads // num_kv_groups
@@ -81,15 +101,17 @@ def grouped_query_attention_forward_kv(num_heads, num_kv_groups, head_dim, cos, 
         queries = apply_qk_norm(queries, params["q_norm"])
         keys = apply_qk_norm(keys, params["k_norm"])
 
-    queries = apply_rope_with_offset(queries, cos, sin, position_offset)
-    keys = apply_rope_with_offset(keys, cos, sin, position_offset)
+    #queries = jnp.resize(queries, queries.shape[:-2] + (cfg['context_length'],queries.shape[-1]))
+    #keys = jnp.resize(keys, keys.shape[:-2] + (cfg['context_length'],keys.shape[-1]))
+
+    queries = apply_rope_with_offset(queries, cos, sin, position_offset) #[:os]
+    keys = apply_rope_with_offset(keys, cos, sin, position_offset) #[:os]
     
     keys = jnp.concatenate([kv_cache["keys"][:,:, :position_offset], keys], axis=2)
     values = jnp.concatenate([kv_cache["values"][:,:,:position_offset], values], axis=2)
     
     kv_cache["keys"] = kv_cache["keys"].at[:,:,:keys.shape[2]].set(keys)
     kv_cache["values"] = kv_cache["values"].at[:,:,:values.shape[2]].set(values)
-    #new_cache = {"keys": keys, "values": values}
     new_cache = kv_cache
     position_offset_new = keys.shape[2]
     
@@ -136,20 +158,24 @@ def qwen3_forward_kv(params, x, cfg, kv_cache, position_offset):
     
     return logits, new_cache, position_offset_new
 
-def generate_kv_optimized(model, idx, max_new_tokens, context_size, temperature=0.7, top_k=50, eos_id=None, batch_size=1):
+def generate_kv_optimized(model, idx, max_new_tokens, context_size, temperature=0.7, top_k=50, eos_id=None):
     params, cfg = model["params"], model["cfg"]
     cfg.pop('dtype')
     
     # Keep input on device
-    cur_ids = jnp.array([idx] * batch_size) if batch_size > 1 else jnp.array([idx])
+    cur_ids = jnp.array([idx])
     key = jax.random.PRNGKey(42)
     
     # Initialize KV cache for batch processing
-    kv_cache = [{"keys": jnp.zeros((batch_size, cfg["n_kv_groups"], context_size, cfg["head_dim"])), 
-                 "values": jnp.zeros((batch_size, cfg["n_kv_groups"], context_size, cfg["head_dim"]))} 
+    kv_cache = [{"keys": jnp.zeros((1, cfg["n_kv_groups"], context_size, cfg["head_dim"])), 
+                 "values": jnp.zeros((1, cfg["n_kv_groups"], context_size, cfg["head_dim"]))} 
                 for _ in range(cfg["n_layers"])]
     position_offset = 0
     
+    #for i in tqdm(cur_ids):
+    #logits, kv_cache, position_offset = qwen3_forward_kv(params, cur_ids[i], cfg, kv_cache, position_offset)
+
+
     logits, kv_cache, position_offset = qwen3_forward_kv(params, cur_ids, cfg, kv_cache, position_offset)
     
     for i in tqdm(range(max_new_tokens), desc="Generating"):
@@ -162,7 +188,7 @@ def generate_kv_optimized(model, idx, max_new_tokens, context_size, temperature=
             mask = jnp.take_along_axis(mask, top_k_indices, axis=-1)
             mask = jnp.where(jnp.arange(mask.shape[-1])[None, :] < top_k, top_k_logits, -jnp.inf)
             next_token_logits = jnp.full_like(next_token_logits, -jnp.inf)
-            next_token_logits = next_token_logits.at[jnp.arange(batch_size)[:, None], top_k_indices].set(mask)
+            next_token_logits = next_token_logits.at[jnp.arange(1)[:, None], top_k_indices].set(mask)
         
         if temperature > 0.0:
             next_token_logits = next_token_logits / temperature
