@@ -87,7 +87,10 @@ def grouped_query_attention_forward_kv(num_heads, num_kv_groups, head_dim, cos, 
     keys = jnp.concatenate([kv_cache["keys"][:,:, :position_offset], keys], axis=2)
     values = jnp.concatenate([kv_cache["values"][:,:,:position_offset], values], axis=2)
     
-    new_cache = {"keys": keys, "values": values}
+    kv_cache["keys"] = kv_cache["keys"].at[:,:,:keys.shape[2]].set(keys)
+    kv_cache["values"] = kv_cache["values"].at[:,:,:values.shape[2]].set(values)
+    #new_cache = {"keys": keys, "values": values}
+    new_cache = kv_cache
     position_offset_new = keys.shape[2]
     
     keys_expanded = jnp.repeat(keys, group_size, axis=1)
