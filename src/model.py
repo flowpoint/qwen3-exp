@@ -270,6 +270,7 @@ def steptop(params, cfg):
 
 
 #scan(step, init=[params, cfg, kv_cache])(next_token, position_offset)
+import time
 
 def generate_kv_optimized(model, idx, max_new_tokens, context_size, temperature=0.7, top_k=50, eos_id=None):
     params, cfg = model["params"], model["cfg"]
@@ -296,6 +297,17 @@ def generate_kv_optimized(model, idx, max_new_tokens, context_size, temperature=
                 f, 
                 init=[logits, kv_cache, position_offset, cur_ids], length=max_new_tokens
                 )
+        [logits, kv_cache, position_offset, cur_ids], _ = jax.lax.scan(
+                f, 
+                init=[logits, kv_cache, position_offset, cur_ids], length=max_new_tokens
+                )
+        stt = time.time()
+        [logits, kv_cache, position_offset, cur_ids], _ = jax.lax.scan(
+                f, 
+                init=[logits, kv_cache, position_offset, cur_ids], length=max_new_tokens
+                )
+        fin = time.time()
+        print(f"time: {fin-stt}")
     else:
         for i in tqdm(range(max_new_tokens), desc="Generating"):
             [logits, kv_cache, position_offset, cur_ids], _ = f([logits, kv_cache, position_offset, cur_ids], None)
