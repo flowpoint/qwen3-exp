@@ -224,7 +224,7 @@ if __name__ == "__main__":
     output_token_ids = generate_kv_optimized(
         model=model, idx=input_token_ids, max_new_tokens=20,
         context_size=QWEN3_CONFIG["context_length"], top_k=1,
-        temperature=0, eos_id=None, batch_size=1
+        temperature=0, eos_id=None
     )
     
     generation_time = time.time() - start_time

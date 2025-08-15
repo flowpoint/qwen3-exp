@@ -69,6 +69,18 @@ def apply_rope_with_offset(x, cos, sin, position_offset=0):
     rotated = jnp.concatenate([-x2, x1], axis=-1)
     return ((x * cos_slice) + (rotated * sin_slice)).astype(dtype)[:,:,:os,:]
 '''
+def apply_rope_with_offset_pre(x, cos, sin, position_offset=0):
+    seq_len = x.shape[2]
+    x1, x2 = x[..., :x.shape[-1]//2], x[..., x.shape[-1]//2:]
+    
+    positions = jnp.arange(position_offset, position_offset + seq_len)
+    cos_slice = cos[positions, :][None, None, :, :]
+    sin_slice = sin[positions, :][None, None, :, :]
+    
+    rotated = jnp.concatenate([-x2, x1], axis=-1)
+    return ((x * cos_slice) + (rotated * sin_slice)).astype(dtype)
+
+@jax.jit
 def apply_rope_with_offset(x, cos, sin, position_offset=0):
     seq_len = x.shape[2]
     x1, x2 = x[..., :x.shape[-1]//2], x[..., x.shape[-1]//2:]
@@ -86,8 +98,7 @@ def apply_qk_norm(x, norm_params):
     x_normed = rmsnorm_forward(norm_params, x_reshaped)
     return x_normed.reshape(b, h, s, d)
 
-#@partial(jax.jit, static_argnums=[0,1,2,8])
-def grouped_query_attention_forward_kv(num_heads, num_kv_groups, head_dim, cos, sin, params, mask,  kv_cache, qk_norm, position_offset, x):
+def grouped_query_attention_forward_kv_pre(num_heads, num_kv_groups, head_dim, cos, sin, params, mask,  kv_cache, qk_norm, position_offset, x):
     b, seq, d_in = x.shape
     group_size = num_heads // num_kv_groups
     
@@ -101,11 +112,8 @@ def grouped_query_attention_forward_kv(num_heads, num_kv_groups, head_dim, cos, 
         queries = apply_qk_norm(queries, params["q_norm"])
         keys = apply_qk_norm(keys, params["k_norm"])
 
-    #queries = jnp.resize(queries, queries.shape[:-2] + (cfg['context_length'],queries.shape[-1]))
-    #keys = jnp.resize(keys, keys.shape[:-2] + (cfg['context_length'],keys.shape[-1]))
-
-    queries = apply_rope_with_offset(queries, cos, sin, position_offset) #[:os]
-    keys = apply_rope_with_offset(keys, cos, sin, position_offset) #[:os]
+    queries = apply_rope_with_offset_pre(queries, cos, sin, position_offset)
+    keys = apply_rope_with_offset_pre(keys, cos, sin, position_offset)
     
     keys = jnp.concatenate([kv_cache["keys"][:,:, :position_offset], keys], axis=2)
     values = jnp.concatenate([kv_cache["values"][:,:,:position_offset], values], axis=2)
@@ -132,10 +140,59 @@ def grouped_query_attention_forward_kv(num_heads, num_kv_groups, head_dim, cos, 
 
     return output, new_cache, position_offset_new
 
+@partial(jax.jit, static_argnums=[0,1,2,8])
+def grouped_query_attention_forward_kv(num_heads, num_kv_groups, head_dim, cos, sin, params, mask,  kv_cache, qk_norm, position_offset, x):
+    b, seq, d_in = x.shape
+    group_size = num_heads // num_kv_groups
+    
+    #assert position_offset == kv_cache["keys"].shape[2], f"{kv_cache['keys'].shape[2]} {position_offset}"
+    
+    queries = jnp.einsum('bsd,dh->bsh', x, params["W_query"]).reshape(b, seq, num_heads, head_dim).transpose(0,2,1,3)
+    keys = jnp.einsum('bsd,dh->bsh', x, params["W_key"]).reshape(b, seq, num_kv_groups, head_dim).transpose(0,2,1,3)
+    values = jnp.einsum('bsd,dh->bsh', x, params["W_value"]).reshape(b, seq, num_kv_groups, head_dim).transpose(0,2,1,3)
+
+    if qk_norm and "q_norm" in params and "k_norm" in params:
+        queries = apply_qk_norm(queries, params["q_norm"])
+        keys = apply_qk_norm(keys, params["k_norm"])
+
+    queries = apply_rope_with_offset(queries, cos, sin, position_offset)
+    keys = apply_rope_with_offset(keys, cos, sin, position_offset)
+    
+    keys = jnp.concatenate([kv_cache["keys"][:,:, :position_offset], keys], axis=2)
+    values = jnp.concatenate([kv_cache["values"][:,:,:position_offset], values], axis=2)
+    
+    kv_cache["keys"] = kv_cache["keys"].at[:,:,:keys.shape[2]].set(keys)
+    kv_cache["values"] = kv_cache["values"].at[:,:,:values.shape[2]].set(values)
+    new_cache = kv_cache
+    position_offset_new = keys.shape[2]
+    
+    keys_expanded = jnp.repeat(keys, group_size, axis=1)
+    values_expanded = jnp.repeat(values, group_size, axis=1)
+    
+    attn_scores = jnp.einsum('bnqh,bnkh->bnqk', queries, keys_expanded) / jnp.sqrt(head_dim)
+    
+    if position_offset == 0:
+        q_len, k_len = queries.shape[2], keys.shape[2]
+        causal_mask = jnp.triu(jnp.ones((q_len, k_len)), k=1)
+        attn_scores = jnp.where(causal_mask[None, None, :, :], -jnp.inf, attn_scores)
+    
+    attn_weights = jax.nn.softmax(attn_scores, axis=-1)
+    context = jnp.einsum('bnqk,bnkh->bnqh', attn_weights, values_expanded)
+    context = context.transpose(0,2,1,3).reshape(b, seq, num_heads * head_dim)
+    output = jnp.einsum('bsh,hd->bsd', context, params["out_proj"])
+
+    return output, new_cache, position_offset_new
+
+def rms2(norm1, x):
+    return jax.vmap(lambda y: rmsnorm_forward(norm1, y))(x)
+
 def transformer_block_forward_kv(params, mask, cos, sin, kv_cache, position_offset, x):
     shortcut = x
     x = rmsnorm_forward(params["norm1"], x)
-    x, new_cache, position_offset = grouped_query_attention_forward_kv(cfg["n_heads"], cfg["n_kv_groups"], cfg["head_dim"], cos, sin, params["att"], mask,  kv_cache, cfg["qk_norm"], position_offset, x)
+    if x.shape[2] == 1:
+        x, new_cache, position_offset = grouped_query_attention_forward_kv(cfg["n_heads"], cfg["n_kv_groups"], cfg["head_dim"], cos, sin, params["att"], mask,  kv_cache, cfg["qk_norm"], position_offset, x)
+    else:
+        x, new_cache, position_offset = grouped_query_attention_forward_kv_pre(cfg["n_heads"], cfg["n_kv_groups"], cfg["head_dim"], cos, sin, params["att"], mask,  kv_cache, cfg["qk_norm"], position_offset, x)
     x = x + shortcut
     shortcut = x
     x = rmsnorm_forward(params["norm2"], x)
