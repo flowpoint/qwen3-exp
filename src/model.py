@@ -80,7 +80,6 @@ def apply_rope_with_offset_pre(x, cos, sin, position_offset=0):
     rotated = jnp.concatenate([-x2, x1], axis=-1)
     return ((x * cos_slice) + (rotated * sin_slice)).astype(dtype)
 
-@jax.jit
 def apply_rope_with_offset(x, cos, sin, position_offset=0):
     seq_len = x.shape[2]
     x1, x2 = x[..., :x.shape[-1]//2], x[..., x.shape[-1]//2:]
@@ -140,7 +139,7 @@ def grouped_query_attention_forward_kv_pre(num_heads, num_kv_groups, head_dim, c
 
     return output, new_cache, position_offset_new
 
-@partial(jax.jit, static_argnums=[0,1,2,8])
+@partial(jax.jit, static_argnums=[0,1,2,3,4, 6, 8])
 def grouped_query_attention_forward_kv(num_heads, num_kv_groups, head_dim, cos, sin, params, mask,  kv_cache, qk_norm, position_offset, x):
     b, seq, d_in = x.shape
     group_size = num_heads // num_kv_groups
@@ -215,6 +214,29 @@ def qwen3_forward_kv(params, x, cfg, kv_cache, position_offset):
     
     return logits, new_cache, position_offset_new
 
+
+def steptop(params, cfg):
+    def step(args,_):#logits, kv_cache, position_offset, cur_ids):
+        logits, kv_cache, position_offset, cur_ids = args
+
+        next_token_logits = logits[:, -1, :]
+        next_token = jnp.argmax(next_token_logits, axis=-1)
+
+        '''
+        if eos_id is not None and jnp.any(next_token == eos_id):
+            break
+        '''
+        
+        cur_ids = jnp.concatenate([cur_ids, next_token[:, None]], axis=1)
+        
+        # Process next tokens for entire batch
+        logits, kv_cache, position_offset = qwen3_forward_kv(params, next_token[:, None], cfg, kv_cache, position_offset)
+        return [logits, kv_cache, position_offset, cur_ids], None
+    return step
+
+
+#scan(step, init=[params, cfg, kv_cache])(next_token, position_offset)
+
 def generate_kv_optimized(model, idx, max_new_tokens, context_size, temperature=0.7, top_k=50, eos_id=None):
     params, cfg = model["params"], model["cfg"]
     cfg.pop('dtype')
@@ -229,12 +251,17 @@ def generate_kv_optimized(model, idx, max_new_tokens, context_size, temperature=
                 for _ in range(cfg["n_layers"])]
     position_offset = 0
     
-    #for i in tqdm(cur_ids):
-    #logits, kv_cache, position_offset = qwen3_forward_kv(params, cur_ids[i], cfg, kv_cache, position_offset)
-
-
     logits, kv_cache, position_offset = qwen3_forward_kv(params, cur_ids, cfg, kv_cache, position_offset)
+
+    f = steptop(params, cfg)
+    #logits, kv_cache, position_offset, cur_ids = jax.lax.scan(f, init=[logits, kv_cache, position_offset, cur_ids], length=max_new_tokens)()
+
+
+    for i in tqdm(range(max_new_tokens), desc="Generating"):
+        [logits, kv_cache, position_offset, cur_ids], _ = f([logits, kv_cache, position_offset, cur_ids], None)
+
     
+    '''
     for i in tqdm(range(max_new_tokens), desc="Generating"):
         next_token_logits = logits[:, -1, :]
         
@@ -262,5 +289,6 @@ def generate_kv_optimized(model, idx, max_new_tokens, context_size, temperature=
         
         # Process next tokens for entire batch
         logits, kv_cache, position_offset = qwen3_forward_kv(params, next_token[:, None], cfg, kv_cache, position_offset)
+        '''
     
     return cur_ids
