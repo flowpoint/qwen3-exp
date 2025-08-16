@@ -23,10 +23,11 @@ def feedforward_forward(params, x):
     up = jnp.einsum('bse,eh->bsh', x, params["up_proj"])
     return jnp.einsum('bsh,he->bse', gate * up, params["down_proj"])
 
-#dtype = jax.dtypes.bfloat16
-dtype = jnp.float32
-#cl = 40960
-cl = 1024
+dtype = jax.dtypes.bfloat16
+#dtype = jnp.float32
+cl = 40960
+#cl = 1024
+#cl = 1024*32
 
 cfg = {
     "vocab_size": 151936, "context_length": cl, "emb_dim": 1024, "n_heads": 16,
@@ -237,8 +238,6 @@ def qwen3_forward_kv_pre(params, x, cfg, kv_cache, position_offset):
     return logits, new_cache, position_offset_new
 
 
-
-
 def steptop(params, cfg):
     #@jax.jit
     def step(args,_):#logits, kv_cache, position_offset, cur_ids):
@@ -256,8 +255,8 @@ def steptop(params, cfg):
         
         # Process next tokens for entire batch
         logits, kv_cache, position_offset = qwen3_forward_kv(params, next_token[:, None], cfg, kv_cache, position_offset)
-        #return [logits, kv_cache, position_offset, cur_ids[:,1:]], None
-        return [logits, kv_cache, position_offset, cur_ids], None
+        return [logits, kv_cache, position_offset, cur_ids[:,1:]], None
+        #return [logits, kv_cache, position_offset, cur_ids], None
     return step
 
 
@@ -283,14 +282,13 @@ def generate_kv_optimized(model, idx, max_new_tokens, context_size, temperature=
     f = steptop(params, cfg)
     [logits, kv_cache, position_offset, cur_ids], _ = f([logits, kv_cache, position_offset, cur_ids], None)
 
-    use_lax = False
+    use_lax = True
     if use_lax:
-        [logits, kv_cache, position_offset, cur_ids], _ = jax.lax.scan(
+        [_, _, _, _], _ = jax.lax.scan(
                 f, 
                 init=[logits, kv_cache, position_offset, cur_ids], length=max_new_tokens
                 )
-        '''
-        [logits, kv_cache, position_offset, cur_ids], _ = jax.lax.scan(
+        [_, _, _, _], _ = jax.lax.scan(
                 f, 
                 init=[logits, kv_cache, position_offset, cur_ids], length=max_new_tokens
                 )
@@ -301,7 +299,6 @@ def generate_kv_optimized(model, idx, max_new_tokens, context_size, temperature=
                 )
         fin = time.time()
         print(f"time: {fin-stt}")
-        '''
     else:
         for i in tqdm(range(max_new_tokens), desc="Generating"):
             [logits, kv_cache, position_offset, cur_ids], _ = f([logits, kv_cache, position_offset, cur_ids], None)
