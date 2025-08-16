@@ -17,7 +17,6 @@ if jax.default_backend() == 'gpu':
 else:
     device =  jax.devices('cpu')[0]
 
-@jax.jit
 def feedforward_forward(params, x):
     gate = jax.nn.silu(jnp.einsum('bse,eh->bsh', x, params["gate_proj"]))
     up = jnp.einsum('bse,eh->bsh', x, params["up_proj"])
@@ -25,8 +24,8 @@ def feedforward_forward(params, x):
 
 dtype = jax.dtypes.bfloat16
 #dtype = jnp.float32
-#cl = 40960
-cl = 1024
+cl = 40960
+#cl = 1024
 #cl = 1024*32
 
 cfg = {
@@ -35,7 +34,6 @@ cfg = {
     "n_kv_groups": 8, "rope_base": 1000000.0, "dtype": 'bfloat16', #torch.bfloat16,
 }
 
-@jax.jit
 def rmsnorm_forward(params, x, eps=1e-6):
     orig_dtype = dtype
     x = x.astype(dtype)
@@ -146,11 +144,13 @@ def grouped_query_attention_forward_kv(num_heads, num_kv_groups, head_dim, cos, 
     keys = apply_rope_with_offset(keys, cos, sin, position_offset)
 
     keys = keys.astype(dtype)
+    #print(keys.shape)
     values = values.astype(dtype)
     
-    #kv_cache["keys"] = kv_cache["keys"].at[:,:,position_offset:position_offset + 1].set(keys)
-    kv_cache['keys'] = jax.lax.dynamic_update_slice_in_dim(kv_cache['keys'], keys, start_index=position_offset, axis=2) 
-    kv_cache['values'] = jax.lax.dynamic_update_slice_in_dim(kv_cache['values'], values, start_index=position_offset, axis=2)
+    kv_cache["keys"] = kv_cache["keys"].at[:,:,position_offset].set(keys[:,:,0])
+    kv_cache["values"] = kv_cache["values"].at[:,:,position_offset].set(values[:,:,0])
+    #kv_cache['keys'] = jax.lax.dynamic_update_slice_in_dim(kv_cache['keys'], keys, start_index=position_offset, axis=2) 
+    #kv_cache['values'] = jax.lax.dynamic_update_slice_in_dim(kv_cache['values'], values, start_index=position_offset, axis=2)
 
     #kv_cache["keys"] = jax.lax.dynamic_slice_in_dim(kv_cache["keys"],position_offset, position_offset + 1, axis=2).set(keys)
     #keys = jnp.concatenate([jax.lax.dynamic_slice_in_dim(kv_cache["keys"], 0, position_offset, axis=2), keys], axis=2)
@@ -213,15 +213,10 @@ def qwen3_forward_kv(params, x, cfg, kv_cache, position_offset):
     
     new_cache = {"keys": [], "values":[]}
     for i, block_params in enumerate(params["trf_blocks"]):
-        #layer_cache = kv_cache[i]
         layer_cache = {"keys": kv_cache["keys"][:,i], "values": kv_cache["values"][:,i]}
         x, updated_cache, position_offset_new = transformer_block_forward_kv(block_params, mask, params["cos"], params["sin"], layer_cache, position_offset, x)
-        #new_cache.append(updated_cache)
-        new_cache["keys"] = new_cache["keys"] + [updated_cache["keys"]]
-        new_cache["values"] = new_cache["values"] + [updated_cache["values"]]
-    
-    kv_cache["keys"] = jnp.stack(new_cache["keys"], axis=1)
-    kv_cache["values"] = jnp.stack(new_cache["values"], axis=1)
+        kv_cache['keys'] = kv_cache['keys'].at[:,i].set(updated_cache['keys'])
+        kv_cache['values'] = kv_cache['values'].at[:,i].set(updated_cache['values'])
     new_cache = kv_cache
 
     x = rmsnorm_forward(params["final_norm"], x)
@@ -229,21 +224,18 @@ def qwen3_forward_kv(params, x, cfg, kv_cache, position_offset):
     
     return logits, new_cache, position_offset_new
 
+
 def qwen3_forward_kv_pre(params, x, cfg, kv_cache, position_offset):
     x = params["tok_emb"][x]
     mask = jnp.triu(jnp.ones((cfg["context_length"], cfg["context_length"]), dtype=bool), k=1)
     
     new_cache = {"keys": [], "values":[]}
     for i, block_params in enumerate(params["trf_blocks"]):
-        #layer_cache = kv_cache[i]
         layer_cache = {"keys": kv_cache["keys"][:,i], "values": kv_cache["values"][:,i]}
         x, updated_cache, position_offset_new = transformer_block_forward_kv_pre(block_params, mask, params["cos"], params["sin"], layer_cache, position_offset, x)
-        #new_cache.append(updated_cache)
-        new_cache["keys"] = new_cache["keys"] + [updated_cache["keys"]]
-        new_cache["values"] = new_cache["values"] + [updated_cache["values"]]
+        kv_cache['keys'] = kv_cache['keys'].at[:,i].set(updated_cache['keys'])
+        kv_cache['values'] = kv_cache['values'].at[:,i].set(updated_cache['values'])
 
-    kv_cache["keys"] = jnp.stack(new_cache["keys"], axis=1)
-    kv_cache["values"] = jnp.stack(new_cache["values"], axis=1)
     new_cache = kv_cache
     
     x = rmsnorm_forward(params["final_norm"], x)

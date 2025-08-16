@@ -16,10 +16,15 @@ try:
 except ImportError:
     snapshot_download = None
 
-os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
+os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'true'
 #os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.5'
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 os.environ['JAX_PLATFORMS'] = 'gpu'
+
+os.environ['XLA_FLAGS'] = (
+    '--xla_gpu_triton_gemm_any=True '
+    '--xla_gpu_enable_latency_hiding_scheduler=true '
+)
 
 '''
 if jax.default_backend() == 'gpu':
