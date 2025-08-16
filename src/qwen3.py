@@ -17,22 +17,27 @@ except ImportError:
     snapshot_download = None
 
 os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
-os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.5'
+#os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.5'
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 os.environ['JAX_PLATFORMS'] = 'gpu'
 
+'''
 if jax.default_backend() == 'gpu':
     device =  jax.devices('gpu')[0]
 else:
     device =  jax.devices('cpu')[0]
+'''
 
 #device = jax.devices('gpu')[0] if jax.devices('gpu') else jax.devices('cpu')[0]
 
-QWEN3_CONFIG = {
+QWEN3_CONFIG = cfg
+'''
+{
     "vocab_size": 151936, "context_length": 40960, "emb_dim": 1024, "n_heads": 16,
     "n_layers": 28, "hidden_dim": 3072, "head_dim": 128, "qk_norm": True,
     "n_kv_groups": 8, "rope_base": 1000000.0, "dtype": 'bfloat16', #torch.bfloat16,
 }
+'''
 
 class Qwen3Tokenizer():
     def __init__(self, tokenizer_file_path="tokenizer.json", repo_id=None):
@@ -69,7 +74,7 @@ def safe_convert_numpy_to_jax(numpy_array):
 
 def batch_convert_numpy_weights(numpy_weights_dict):
     converted = {key: safe_convert_numpy_to_jax(array) for key, array in numpy_weights_dict.items()}
-    return jax.tree.map(lambda x: jax.device_put(x, device), converted)
+    return jax.tree.map(lambda x: jax.device_put(x.astype(jnp.bfloat16), device), converted)
 
 def cleanup_memory():
     if torch.cuda.is_available():
@@ -215,6 +220,8 @@ if __name__ == "__main__":
     key = jax.random.PRNGKey(0)
     params = init_qwen3_params(key, cfg)
     params = load_qwen3_weights_jax_optimized(cfg, params, safetensors_files)
+    #import pickle
+    #pickle.dumps(params, 'params.pickle')
     model = {"params": params, "cfg": cfg}
     
     import time
@@ -222,10 +229,12 @@ if __name__ == "__main__":
     
     # Generate with optimized function (batch_size=1 for single sequence)
     output_token_ids = generate_kv_optimized(
-        model=model, idx=input_token_ids, max_new_tokens=1000,
+        model=model, idx=input_token_ids, max_new_tokens=20,
         context_size=QWEN3_CONFIG["context_length"], top_k=1,
         temperature=0, eos_id=None
     )
+
+    time.sleep(10)
     
     generation_time = time.time() - start_time
     

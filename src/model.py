@@ -25,8 +25,11 @@ def feedforward_forward(params, x):
 
 #dtype = jax.dtypes.bfloat16
 dtype = jnp.float32
+#cl = 40960
+cl = 1024
+
 cfg = {
-    "vocab_size": 151936, "context_length": 40960, "emb_dim": 1024, "n_heads": 16,
+    "vocab_size": 151936, "context_length": cl, "emb_dim": 1024, "n_heads": 16,
     "n_layers": 28, "hidden_dim": 3072, "head_dim": 128, "qk_norm": True,
     "n_kv_groups": 8, "rope_base": 1000000.0, "dtype": 'bfloat16', #torch.bfloat16,
 }
@@ -34,7 +37,7 @@ cfg = {
 @jax.jit
 def rmsnorm_forward(params, x, eps=1e-6):
     orig_dtype = dtype
-    x = x.astype(jnp.float32)
+    x = x.astype(dtype)
     variance = jnp.mean(x ** 2, axis=-1, keepdims=True)
     norm_x = x * jax.lax.rsqrt(variance + eps) * params["scale"]
     return norm_x.astype(orig_dtype)
@@ -52,24 +55,6 @@ def apply_rope(x, cos, sin):
     rotated = jnp.concatenate([-x2, x1], axis=-1)
     return ((x * cos) + (rotated * sin)).astype(dtype)
 
-#@jax.jit
-'''
-def apply_rope_with_offset(x, cos, sin, position_offset=0):
-    #seq_len = x.shape[2]
-    os = x.shape[2]
-    xs = x.shape
-    seq_len = cfg['context_length']
-
-    x = jnp.resize(x, (xs[0], xs[1], seq_len,xs [-1]))
-    x1, x2 = x[..., :x.shape[-1]//2], x[..., x.shape[-1]//2:]
-    
-    positions = jnp.arange(position_offset, position_offset + seq_len)
-    cos_slice = cos[positions, :][None, None, :, :]
-    sin_slice = sin[positions, :][None, None, :, :]
-    
-    rotated = jnp.concatenate([-x2, x1], axis=-1)
-    return ((x * cos_slice) + (rotated * sin_slice)).astype(dtype)[:,:,:os,:]
-'''
 def apply_rope_with_offset_pre(x, cos, sin, position_offset=0):
     seq_len = x.shape[2]
     x1, x2 = x[..., :x.shape[-1]//2], x[..., x.shape[-1]//2:]
@@ -143,12 +128,14 @@ def grouped_query_attention_forward_kv_pre(num_heads, num_kv_groups, head_dim, c
 #@partial(jax.jit, static_argnums=[0,1,2,7,])
 def grouped_query_attention_forward_kv(num_heads, num_kv_groups, head_dim, cos, sin, params, kv_cache, qk_norm, position_offset, x):
     b, seq, d_in = x.shape
-    print(x.shape)
+    #print(x.shape)
     group_size = num_heads // num_kv_groups
     
     queries = jnp.einsum('bsd,dh->bsh', x, params["W_query"]).reshape(b, seq, num_heads, head_dim).transpose(0,2,1,3)
     keys = jnp.einsum('bsd,dh->bsh', x, params["W_key"]).reshape(b, seq, num_kv_groups, head_dim).transpose(0,2,1,3)
     values = jnp.einsum('bsd,dh->bsh', x, params["W_value"]).reshape(b, seq, num_kv_groups, head_dim).transpose(0,2,1,3)
+    keys = keys.astype(dtype)
+    values = values.astype(dtype)
 
     if qk_norm and "q_norm" in params and "k_norm" in params:
         queries = apply_qk_norm(queries, params["q_norm"])
@@ -156,6 +143,9 @@ def grouped_query_attention_forward_kv(num_heads, num_kv_groups, head_dim, cos, 
 
     queries = apply_rope_with_offset(queries, cos, sin, position_offset)
     keys = apply_rope_with_offset(keys, cos, sin, position_offset)
+
+    keys = keys.astype(dtype)
+    values = values.astype(dtype)
     
     #kv_cache["keys"] = kv_cache["keys"].at[:,:,position_offset:position_offset + 1].set(keys)
     kv_cache['keys'] = jax.lax.dynamic_update_slice_in_dim(kv_cache['keys'], keys, start_index=position_offset, axis=2) 
@@ -250,6 +240,7 @@ def qwen3_forward_kv_pre(params, x, cfg, kv_cache, position_offset):
 
 
 def steptop(params, cfg):
+    #@jax.jit
     def step(args,_):#logits, kv_cache, position_offset, cur_ids):
         logits, kv_cache, position_offset, cur_ids = args
 
@@ -265,7 +256,8 @@ def steptop(params, cfg):
         
         # Process next tokens for entire batch
         logits, kv_cache, position_offset = qwen3_forward_kv(params, next_token[:, None], cfg, kv_cache, position_offset)
-        return [logits, kv_cache, position_offset, cur_ids[:,1:]], None
+        #return [logits, kv_cache, position_offset, cur_ids[:,1:]], None
+        return [logits, kv_cache, position_offset, cur_ids], None
     return step
 
 
@@ -281,8 +273,8 @@ def generate_kv_optimized(model, idx, max_new_tokens, context_size, temperature=
     key = jax.random.PRNGKey(42)
     
     # Initialize KV cache for batch processing
-    kv_cache = [{"keys": jnp.zeros((1, cfg["n_kv_groups"], context_size, cfg["head_dim"])), 
-                 "values": jnp.zeros((1, cfg["n_kv_groups"], context_size, cfg["head_dim"]))} 
+    kv_cache = [{"keys": jnp.zeros((1, cfg["n_kv_groups"], context_size, cfg["head_dim"]), dtype=dtype), 
+                 "values": jnp.zeros((1, cfg["n_kv_groups"], context_size, cfg["head_dim"]),dtype=dtype)} 
                 for _ in range(cfg["n_layers"])]
     position_offset = 0
     
@@ -291,12 +283,13 @@ def generate_kv_optimized(model, idx, max_new_tokens, context_size, temperature=
     f = steptop(params, cfg)
     [logits, kv_cache, position_offset, cur_ids], _ = f([logits, kv_cache, position_offset, cur_ids], None)
 
-    use_lax = True
+    use_lax = False
     if use_lax:
         [logits, kv_cache, position_offset, cur_ids], _ = jax.lax.scan(
                 f, 
                 init=[logits, kv_cache, position_offset, cur_ids], length=max_new_tokens
                 )
+        '''
         [logits, kv_cache, position_offset, cur_ids], _ = jax.lax.scan(
                 f, 
                 init=[logits, kv_cache, position_offset, cur_ids], length=max_new_tokens
@@ -308,9 +301,12 @@ def generate_kv_optimized(model, idx, max_new_tokens, context_size, temperature=
                 )
         fin = time.time()
         print(f"time: {fin-stt}")
+        '''
     else:
         for i in tqdm(range(max_new_tokens), desc="Generating"):
             [logits, kv_cache, position_offset, cur_ids], _ = f([logits, kv_cache, position_offset, cur_ids], None)
+            if eos_id is not None and cur_ids[-1] == eos_id:
+                break
 
     
     '''
