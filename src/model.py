@@ -25,8 +25,8 @@ def feedforward_forward(params, x):
 
 dtype = jax.dtypes.bfloat16
 #dtype = jnp.float32
-cl = 40960
-#cl = 1024
+#cl = 40960
+cl = 1024
 #cl = 1024*32
 
 cfg = {
@@ -211,12 +211,19 @@ def qwen3_forward_kv(params, x, cfg, kv_cache, position_offset):
     x = params["tok_emb"][x]
     mask = jnp.triu(jnp.ones((cfg["context_length"], cfg["context_length"]), dtype=bool), k=1)
     
-    new_cache = []
+    new_cache = {"keys": [], "values":[]}
     for i, block_params in enumerate(params["trf_blocks"]):
-        layer_cache = kv_cache[i]
+        #layer_cache = kv_cache[i]
+        layer_cache = {"keys": kv_cache["keys"][:,i], "values": kv_cache["values"][:,i]}
         x, updated_cache, position_offset_new = transformer_block_forward_kv(block_params, mask, params["cos"], params["sin"], layer_cache, position_offset, x)
-        new_cache.append(updated_cache)
+        #new_cache.append(updated_cache)
+        new_cache["keys"] = new_cache["keys"] + [updated_cache["keys"]]
+        new_cache["values"] = new_cache["values"] + [updated_cache["values"]]
     
+    kv_cache["keys"] = jnp.stack(new_cache["keys"], axis=1)
+    kv_cache["values"] = jnp.stack(new_cache["values"], axis=1)
+    new_cache = kv_cache
+
     x = rmsnorm_forward(params["final_norm"], x)
     logits = jnp.einsum('bse,ev->bsv', x, params["out_head"])
     
@@ -226,11 +233,18 @@ def qwen3_forward_kv_pre(params, x, cfg, kv_cache, position_offset):
     x = params["tok_emb"][x]
     mask = jnp.triu(jnp.ones((cfg["context_length"], cfg["context_length"]), dtype=bool), k=1)
     
-    new_cache = []
+    new_cache = {"keys": [], "values":[]}
     for i, block_params in enumerate(params["trf_blocks"]):
-        layer_cache = kv_cache[i]
+        #layer_cache = kv_cache[i]
+        layer_cache = {"keys": kv_cache["keys"][:,i], "values": kv_cache["values"][:,i]}
         x, updated_cache, position_offset_new = transformer_block_forward_kv_pre(block_params, mask, params["cos"], params["sin"], layer_cache, position_offset, x)
-        new_cache.append(updated_cache)
+        #new_cache.append(updated_cache)
+        new_cache["keys"] = new_cache["keys"] + [updated_cache["keys"]]
+        new_cache["values"] = new_cache["values"] + [updated_cache["values"]]
+
+    kv_cache["keys"] = jnp.stack(new_cache["keys"], axis=1)
+    kv_cache["values"] = jnp.stack(new_cache["values"], axis=1)
+    new_cache = kv_cache
     
     x = rmsnorm_forward(params["final_norm"], x)
     logits = jnp.einsum('bse,ev->bsv', x, params["out_head"])
@@ -272,9 +286,9 @@ def generate_kv_optimized(model, idx, max_new_tokens, context_size, temperature=
     key = jax.random.PRNGKey(42)
     
     # Initialize KV cache for batch processing
-    kv_cache = [{"keys": jnp.zeros((1, cfg["n_kv_groups"], context_size, cfg["head_dim"]), dtype=dtype), 
-                 "values": jnp.zeros((1, cfg["n_kv_groups"], context_size, cfg["head_dim"]),dtype=dtype)} 
-                for _ in range(cfg["n_layers"])]
+    n_layers = cfg['n_layers']
+    kv_cache = {"keys": jnp.zeros((1, n_layers, cfg["n_kv_groups"], context_size, cfg["head_dim"]), dtype=dtype), 
+                 "values": jnp.zeros((1, n_layers, cfg["n_kv_groups"], context_size, cfg["head_dim"]),dtype=dtype)} 
     position_offset = 0
     
     logits, kv_cache, position_offset = qwen3_forward_kv_pre(params, cur_ids, cfg, kv_cache, position_offset)
