@@ -18,6 +18,7 @@ except ImportError:
 
 os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'true'
 os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.95'
+os.environ['JAX_ENABLE_COMPILATION_CACHE'] = 'false'
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 os.environ['JAX_PLATFORMS'] = 'gpu'
 

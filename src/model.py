@@ -26,7 +26,7 @@ dtype = jax.dtypes.bfloat16
 #dtype = jnp.float32
 cl = 40960
 #cl = 1024
-#cl = 1024*32
+#cl = 1024*16
 
 cfg = {
     "vocab_size": 151936, "context_length": cl, "emb_dim": 1024, "n_heads": 16,
@@ -251,6 +251,27 @@ def steptop(params, cfg):
 #scan(step, init=[params, cfg, kv_cache])(next_token, position_offset)
 import time
 
+#@jax.jit
+def gen(f, logits, kv_cache, position_offset, cur_ids, max_new_tokens):
+    [logits, kv_cache, position_offset, cur_ids], _ = jax.lax.scan(
+            f, 
+            init=[logits, kv_cache, position_offset, cur_ids], length=max_new_tokens,
+            #unroll=10,
+            )
+    return logits, kv_cache, position_offset, cur_ids
+
+def block(args):
+    for a in args:
+        if isinstance(a, dict):
+            for v in a.values():
+                v.block_until_ready()
+        elif isinstance(a, jax.Array):
+            a.block_until_ready()
+        elif isinstance(a, int):
+            pass
+        else:
+            raise RuntimeError(a)
+
 def generate_kv_optimized(model, idx, max_new_tokens, context_size, temperature=0.7, top_k=50, eos_id=None):
     params, cfg = model["params"], model["cfg"]
     cfg.pop('dtype')
@@ -265,28 +286,56 @@ def generate_kv_optimized(model, idx, max_new_tokens, context_size, temperature=
                  "values": jnp.zeros((1, n_layers, cfg["n_kv_groups"], context_size, cfg["head_dim"]),dtype=dtype)} 
     position_offset = 0
     
+    # prefill1
     logits, kv_cache, position_offset = qwen3_forward_kv_pre(params, cur_ids, cfg, kv_cache, position_offset)
 
+    # get generation function
     f = steptop(params, cfg)
+    # prefill2
     [logits, kv_cache, position_offset, cur_ids], _ = f([logits, kv_cache, position_offset, cur_ids], None)
+    block([logits, kv_cache, position_offset, cur_ids])
+    jax.clear_caches()
+
+    cur_ids2 = jnp.array([[999]*26])
+
+    #logits, kv_cache, position_offset, cur_ids = gen(f, logits, kv_cache, position_offset, cur_ids2, max_new_tokens)
+    traced = jax.jit(gen, static_argnums=[0,5]).trace(f, logits, kv_cache, position_offset, cur_ids2, max_new_tokens)
+    lowered = traced.lower()
+    compiled_gen = lowered.compile()
+    import gc
 
     use_lax = True
     if use_lax:
-        [_, _, _, _], _ = jax.lax.scan(
-                f, 
-                init=[logits, kv_cache, position_offset, cur_ids], length=max_new_tokens
-                )
-        [_, _, _, _], _ = jax.lax.scan(
-                f, 
-                init=[logits, kv_cache, position_offset, cur_ids], length=max_new_tokens
-                )
+        # warmup
+        cur_ids3 = jnp.array([[1999]*26])
+        logits1, kv_cache1, position_offset1, cur_ids1 = compiled_gen(logits, kv_cache, position_offset, cur_ids3)
+        block([logits1, kv_cache1, position_offset1, cur_ids1])
+        del logits1, kv_cache1, position_offset1, cur_ids1
+        gc.collect()
+
         stt = time.time()
-        [logits, kv_cache, position_offset, cur_ids], _ = jax.lax.scan(
-                f, 
-                init=[logits, kv_cache, position_offset, cur_ids], length=max_new_tokens
-                )
+        logits2, kv_cache2, position_offset2, cur_ids2 = compiled_gen(logits, kv_cache, position_offset, cur_ids)
+        block([logits2, kv_cache2, position_offset2, cur_ids2])
         fin = time.time()
+        del logits2, kv_cache2, position_offset2, cur_ids2
         print(f"time: {fin-stt}")
+        gc.collect()
+
+        stt = time.time()
+        logits2, kv_cache2, position_offset2, cur_ids2 = compiled_gen(logits, kv_cache, position_offset, cur_ids)
+        block([logits2, kv_cache2, position_offset2, cur_ids2])
+        fin = time.time()
+        del logits2, kv_cache2, position_offset2, cur_ids2
+        print(f"time: {fin-stt}")
+        gc.collect()
+
+        stt = time.time()
+        logits2, kv_cache2, position_offset2, cur_ids2 = compiled_gen(logits, kv_cache, position_offset, cur_ids)
+        block([logits2, kv_cache2, position_offset2, cur_ids2])
+        fin = time.time()
+        del logits2, kv_cache2, position_offset2, cur_ids2
+        print(f"time: {fin-stt}")
+        gc.collect()
     else:
         for i in tqdm(range(max_new_tokens), desc="Generating"):
             [logits, kv_cache, position_offset, cur_ids], _ = f([logits, kv_cache, position_offset, cur_ids], None)
