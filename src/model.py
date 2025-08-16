@@ -142,26 +142,9 @@ def grouped_query_attention_forward_kv(num_heads, num_kv_groups, head_dim, cos, 
 
     queries = apply_rope_with_offset(queries, cos, sin, position_offset)
     keys = apply_rope_with_offset(keys, cos, sin, position_offset)
-
-    keys = keys.astype(dtype)
-    #print(keys.shape)
-    values = values.astype(dtype)
     
     kv_cache["keys"] = kv_cache["keys"].at[:,:,position_offset].set(keys[:,:,0])
     kv_cache["values"] = kv_cache["values"].at[:,:,position_offset].set(values[:,:,0])
-    #kv_cache['keys'] = jax.lax.dynamic_update_slice_in_dim(kv_cache['keys'], keys, start_index=position_offset, axis=2) 
-    #kv_cache['values'] = jax.lax.dynamic_update_slice_in_dim(kv_cache['values'], values, start_index=position_offset, axis=2)
-
-    #kv_cache["keys"] = jax.lax.dynamic_slice_in_dim(kv_cache["keys"],position_offset, position_offset + 1, axis=2).set(keys)
-    #keys = jnp.concatenate([jax.lax.dynamic_slice_in_dim(kv_cache["keys"], 0, position_offset, axis=2), keys], axis=2)
-    #kv_cache["values"] = kv_cache["values"].at[:,:,position_offset:position_offset + 1].set(values)
-    #kv_cache["values"] = jax.lax.dynamic_slice_in_dim(kv_cache["values"],position_offset, position_offset + 1, axis=2).set(values)
-
-    #keys = kv_cache["keys"][:, :, :position_offset+1]
-    #values = kv_cache["values"][:, :, :position_offset+1]
-
-    #keys = jax.lax.dynamic_slice_in_dim(kv_cache["keys"], 0, position_offset+1, axis=2)
-    #values = jax.lax.dynamic_slice_in_dim(kv_cache["values"], 0, position_offset+1, axis=2)
     keys = kv_cache['keys']
     values = kv_cache['values']
 
@@ -186,7 +169,7 @@ def grouped_query_attention_forward_kv(num_heads, num_kv_groups, head_dim, cos, 
 def rms2(norm1, x):
     return jax.vmap(lambda y: rmsnorm_forward(norm1, y))(x)
 
-def transformer_block_forward_kv(params, mask, cos, sin, kv_cache, position_offset, x):
+def transformer_block_forward_kv(params, cos, sin, kv_cache, position_offset, x):
     shortcut = x
     x = rmsnorm_forward(params["norm1"], x)
     x, new_cache, position_offset = grouped_query_attention_forward_kv(cfg["n_heads"], cfg["n_kv_groups"], cfg["head_dim"], cos, sin, params["att"], kv_cache, cfg["qk_norm"], position_offset, x)
@@ -209,12 +192,11 @@ def transformer_block_forward_kv_pre(params, mask, cos, sin, kv_cache, position_
 
 def qwen3_forward_kv(params, x, cfg, kv_cache, position_offset):
     x = params["tok_emb"][x]
-    mask = jnp.triu(jnp.ones((cfg["context_length"], cfg["context_length"]), dtype=bool), k=1)
-    
+
     new_cache = {"keys": [], "values":[]}
     for i, block_params in enumerate(params["trf_blocks"]):
         layer_cache = {"keys": kv_cache["keys"][:,i], "values": kv_cache["values"][:,i]}
-        x, updated_cache, position_offset_new = transformer_block_forward_kv(block_params, mask, params["cos"], params["sin"], layer_cache, position_offset, x)
+        x, updated_cache, position_offset_new = transformer_block_forward_kv(block_params, params["cos"], params["sin"], layer_cache, position_offset, x)
         kv_cache['keys'] = kv_cache['keys'].at[:,i].set(updated_cache['keys'])
         kv_cache['values'] = kv_cache['values'].at[:,i].set(updated_cache['values'])
     new_cache = kv_cache

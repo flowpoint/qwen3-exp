@@ -17,7 +17,7 @@ except ImportError:
     snapshot_download = None
 
 os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'true'
-#os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.5'
+os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.95'
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 os.environ['JAX_PLATFORMS'] = 'gpu'
 
@@ -234,7 +234,7 @@ if __name__ == "__main__":
     
     # Generate with optimized function (batch_size=1 for single sequence)
     output_token_ids = generate_kv_optimized(
-        model=model, idx=input_token_ids, max_new_tokens=20,
+        model=model, idx=input_token_ids, max_new_tokens=1000,
         context_size=QWEN3_CONFIG["context_length"], top_k=1,
         temperature=0, eos_id=None
     )
