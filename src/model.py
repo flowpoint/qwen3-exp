@@ -113,6 +113,8 @@ def grouped_query_attention_forward_kv_pre(num_heads, num_kv_groups, head_dim, c
     keys_expanded = jnp.repeat(keys, group_size, axis=1)
     values_expanded = jnp.repeat(values, group_size, axis=1)
     
+    print(queries.shape)
+    print(keys_expanded.shape)
     attn_scores = jnp.einsum('bnqh,bnkh->bnqk', queries, keys_expanded) / jnp.sqrt(head_dim)
     
     if position_offset == 0:
@@ -232,7 +234,7 @@ def qwen3_forward_kv_pre(params, x, cfg, kv_cache, position_offset):
 def steptop(params, cfg):
     #@jax.jit
     def step(args,_):#logits, kv_cache, position_offset, cur_ids):
-        logits, kv_cache, position_offset, cur_ids = args
+        logits, kv_cache, position_offset = args
 
         next_token_logits = logits[:, -1, :]
         next_token = jnp.argmax(next_token_logits, axis=-1)
@@ -242,11 +244,11 @@ def steptop(params, cfg):
             break
         '''
         
-        cur_ids = jnp.concatenate([cur_ids, next_token[:, None]], axis=1)
+        #cur_ids = jnp.concatenate([cur_ids, next_token[:, None]], axis=1)
         
         # Process next tokens for entire batch
         logits, kv_cache, position_offset = qwen3_forward_kv(params, next_token[:, None], cfg, kv_cache, position_offset)
-        return [logits, kv_cache, position_offset, cur_ids[:,1:]], next_token
+        return [logits, kv_cache, position_offset ], next_token
         #return [logits, kv_cache, position_offset, cur_ids], None
     return step
 
@@ -255,13 +257,13 @@ def steptop(params, cfg):
 import time
 
 #@jax.jit
-def gen(f, logits, kv_cache, position_offset, cur_ids, max_new_tokens):
-    [logits, kv_cache, position_offset, cur_ids], seq = jax.lax.scan(
+def gen(f, logits, kv_cache, position_offset,  max_new_tokens):
+    [logits, kv_cache, position_offset], seq = jax.lax.scan(
             f, 
-            init=[logits, kv_cache, position_offset, cur_ids], length=max_new_tokens,
+            init=[logits, kv_cache, position_offset], length=max_new_tokens,
             unroll=False, #20,
             )
-    return [logits, kv_cache, position_offset, cur_ids], seq
+    return [logits, kv_cache, position_offset], seq
 
 def block(args):
     for a in args:
@@ -302,18 +304,20 @@ def generate_kv_optimized(model, idx, max_new_tokens, context_size, temperature=
     
     # prefill1
     logits, kv_cache, position_offset = qwen3_forward_kv_pre(params, cur_ids, cfg, kv_cache, position_offset)
+    exit()
 
     # get generation function
     f = steptop(params, cfg)
     # prefill2
-    [logits, kv_cache, position_offset, cur_ids], _ = f([logits, kv_cache, position_offset, cur_ids], None)
-    block([logits, kv_cache, position_offset, cur_ids])
+    [logits, kv_cache, position_offset], _ = f([logits, kv_cache, position_offset], None)
+    block([logits, kv_cache, position_offset])
     jax.clear_caches()
 
     cur_ids2 = jnp.array([[999]*26])
 
     #logits, kv_cache, position_offset, cur_ids = gen(f, logits, kv_cache, position_offset, cur_ids2, max_new_tokens)
-    traced = jax.jit(gen, static_argnums=[0,3,5]).trace(f, logits, kv_cache, position_offset, cur_ids2, max_new_tokens)
+    exit()
+    traced = jax.jit(gen, static_argnums=[0,3,4]).trace(f, logits, kv_cache, position_offset, max_new_tokens)
     lowered = traced.lower()
     compiled_gen = lowered.compile()
     import gc
@@ -322,16 +326,16 @@ def generate_kv_optimized(model, idx, max_new_tokens, context_size, temperature=
     if use_lax:
         # warmup
         cur_ids3 = jnp.array([[1999]*26])
-        [logits1, kv_cache1, position_offset1, cur_ids1], seq2 = compiled_gen(logits, kv_cache, cur_ids3)
-        block([logits1, kv_cache1, position_offset1, cur_ids1, seq2])
-        del logits1, kv_cache1, position_offset1, cur_ids1
+        [logits1, kv_cache1, position_offset1], seq2 = compiled_gen(logits, kv_cache)
+        block([logits1, kv_cache1, position_offset1, seq2])
+        del logits1, kv_cache1, position_offset1, 
         gc.collect()
 
         stt = time.time()
-        [logits2, kv_cache2, position_offset2, cur_ids2], seq2 = compiled_gen(logits, kv_cache, cur_ids)
-        block([logits2, kv_cache2, position_offset2, cur_ids2, seq2])
+        [logits2, kv_cache2, position_offset2], seq2 = compiled_gen(logits, kv_cache)
+        block([logits2, kv_cache2, position_offset2, seq2])
         fin = time.time()
-        del logits2, kv_cache2, position_offset2, cur_ids2
+        del logits2, kv_cache2, position_offset2, 
         print(f"time: {fin-stt}")
         gc.collect()
 
@@ -346,10 +350,10 @@ def generate_kv_optimized(model, idx, max_new_tokens, context_size, temperature=
         if profile:
             jax.profiler.start_trace("/tmp/jax-trace1")#, profiler_options=options)
 
-        [logits2, kv_cache2, position_offset2, cur_ids2], seq = compiled_gen(logits, kv_cache, cur_ids)
-        block([logits2, kv_cache2, position_offset2, cur_ids2, seq])
+        [logits2, kv_cache2, position_offset2], seq = compiled_gen(logits, kv_cache )
+        block([logits2, kv_cache2, position_offset2, seq])
         fin = time.time()
-        del logits2, kv_cache2, position_offset2, cur_ids2
+        del logits2, kv_cache2, position_offset2, 
         tps = max_new_tokens / (fin-stt) 
         print(f"time: {fin-stt} for {max_new_tokens} at {tps} tok/s")
         gc.collect()
@@ -358,7 +362,7 @@ def generate_kv_optimized(model, idx, max_new_tokens, context_size, temperature=
             jax.profiler.stop_trace()
     else:
         for i in tqdm(range(max_new_tokens), desc="Generating"):
-            [logits, kv_cache, position_offset, cur_ids], _ = f([logits, kv_cache, position_offset, cur_ids], None)
+            [logits, kv_cache, position_offset, ], seq = f([logits, kv_cache, position_offset, ], None)
             if eos_id is not None and cur_ids[-1] == eos_id:
                 break
 
@@ -393,7 +397,4 @@ def generate_kv_optimized(model, idx, max_new_tokens, context_size, temperature=
         logits, kv_cache, position_offset = qwen3_forward_kv(params, next_token[:, None], cfg, kv_cache, position_offset)
         '''
     
-    #return cur_ids
-    #print(cur_ids)
-    #print(jnp.stack(seq,axis=-1))
     return jnp.stack(seq, axis=-1)
