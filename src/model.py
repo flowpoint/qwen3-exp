@@ -1,7 +1,7 @@
 import jax
 import jax.numpy as jnp
 from tokenizers import Tokenizer
-import torch
+#import torch
 from safetensors.numpy import load_file 
 import os
 from pathlib import Path
@@ -10,9 +10,10 @@ from collections import defaultdict
 import numpy as np 
 from tqdm import tqdm
 
-from functools import partial
+from functools import partial, reduce
 
-if jax.default_backend() == 'gpu':
+use_gpu = True
+if use_gpu and jax.default_backend() == 'gpu':
     device =  jax.devices('gpu')[0]
 else:
     device =  jax.devices('cpu')[0]
@@ -23,9 +24,11 @@ def feedforward_forward(params, x):
     return jnp.einsum('bsh,he->bse', gate * up, params["down_proj"])
 
 dtype = jax.dtypes.bfloat16
+#dtype = jnp.float16
 #dtype = jnp.float32
 cl = 40960
 #cl = 1024
+#cl = 27
 #cl = 1024*16
 
 cfg = {
@@ -243,7 +246,7 @@ def steptop(params, cfg):
         
         # Process next tokens for entire batch
         logits, kv_cache, position_offset = qwen3_forward_kv(params, next_token[:, None], cfg, kv_cache, position_offset)
-        return [logits, kv_cache, position_offset, cur_ids[:,1:]], None
+        return [logits, kv_cache, position_offset, cur_ids[:,1:]], next_token
         #return [logits, kv_cache, position_offset, cur_ids], None
     return step
 
@@ -253,12 +256,12 @@ import time
 
 #@jax.jit
 def gen(f, logits, kv_cache, position_offset, cur_ids, max_new_tokens):
-    [logits, kv_cache, position_offset, cur_ids], _ = jax.lax.scan(
+    [logits, kv_cache, position_offset, cur_ids], seq = jax.lax.scan(
             f, 
             init=[logits, kv_cache, position_offset, cur_ids], length=max_new_tokens,
-            #unroll=10,
+            unroll=False, #20,
             )
-    return logits, kv_cache, position_offset, cur_ids
+    return [logits, kv_cache, position_offset, cur_ids], seq
 
 def block(args):
     for a in args:
@@ -275,6 +278,7 @@ def block(args):
 def generate_kv_optimized(model, idx, max_new_tokens, context_size, temperature=0.7, top_k=50, eos_id=None):
     params, cfg = model["params"], model["cfg"]
     cfg.pop('dtype')
+    import operator
     
     # Keep input on device
     cur_ids = jnp.array([idx])
@@ -282,8 +286,18 @@ def generate_kv_optimized(model, idx, max_new_tokens, context_size, temperature=
     
     # Initialize KV cache for batch processing
     n_layers = cfg['n_layers']
-    kv_cache = {"keys": jnp.zeros((1, n_layers, cfg["n_kv_groups"], context_size, cfg["head_dim"]), dtype=dtype), 
-                 "values": jnp.zeros((1, n_layers, cfg["n_kv_groups"], context_size, cfg["head_dim"]),dtype=dtype)} 
+    n_kv_groups = cfg['n_kv_groups']
+    head_dim = cfg['head_dim']
+    kv_cache = {"keys": jnp.zeros((1, n_layers, n_kv_groups, context_size, head_dim), dtype=dtype), 
+                 "values": jnp.zeros((1, n_layers, n_kv_groups, context_size, head_dim),dtype=dtype)} 
+    csk = reduce(operator.mul, kv_cache['keys'].shape)
+    csv = reduce(operator.mul, kv_cache['values'].shape)
+    fs = csk+csv
+    prec_factor = 2 # for bfloat16 or float16
+    fs_gb = (fs / 1_000_000_000) * prec_factor
+
+    print(f"cache size is: {fs}")
+    print(f"cache size is: {fs_gb} GB")
     position_offset = 0
     
     # prefill1
@@ -299,7 +313,7 @@ def generate_kv_optimized(model, idx, max_new_tokens, context_size, temperature=
     cur_ids2 = jnp.array([[999]*26])
 
     #logits, kv_cache, position_offset, cur_ids = gen(f, logits, kv_cache, position_offset, cur_ids2, max_new_tokens)
-    traced = jax.jit(gen, static_argnums=[0,5]).trace(f, logits, kv_cache, position_offset, cur_ids2, max_new_tokens)
+    traced = jax.jit(gen, static_argnums=[0,3,5]).trace(f, logits, kv_cache, position_offset, cur_ids2, max_new_tokens)
     lowered = traced.lower()
     compiled_gen = lowered.compile()
     import gc
@@ -308,34 +322,40 @@ def generate_kv_optimized(model, idx, max_new_tokens, context_size, temperature=
     if use_lax:
         # warmup
         cur_ids3 = jnp.array([[1999]*26])
-        logits1, kv_cache1, position_offset1, cur_ids1 = compiled_gen(logits, kv_cache, position_offset, cur_ids3)
-        block([logits1, kv_cache1, position_offset1, cur_ids1])
+        [logits1, kv_cache1, position_offset1, cur_ids1], seq2 = compiled_gen(logits, kv_cache, cur_ids3)
+        block([logits1, kv_cache1, position_offset1, cur_ids1, seq2])
         del logits1, kv_cache1, position_offset1, cur_ids1
         gc.collect()
 
         stt = time.time()
-        logits2, kv_cache2, position_offset2, cur_ids2 = compiled_gen(logits, kv_cache, position_offset, cur_ids)
-        block([logits2, kv_cache2, position_offset2, cur_ids2])
+        [logits2, kv_cache2, position_offset2, cur_ids2], seq2 = compiled_gen(logits, kv_cache, cur_ids)
+        block([logits2, kv_cache2, position_offset2, cur_ids2, seq2])
         fin = time.time()
         del logits2, kv_cache2, position_offset2, cur_ids2
         print(f"time: {fin-stt}")
         gc.collect()
 
-        stt = time.time()
-        logits2, kv_cache2, position_offset2, cur_ids2 = compiled_gen(logits, kv_cache, position_offset, cur_ids)
-        block([logits2, kv_cache2, position_offset2, cur_ids2])
-        fin = time.time()
-        del logits2, kv_cache2, position_offset2, cur_ids2
-        print(f"time: {fin-stt}")
-        gc.collect()
+        time.sleep(5)
 
         stt = time.time()
-        logits2, kv_cache2, position_offset2, cur_ids2 = compiled_gen(logits, kv_cache, position_offset, cur_ids)
-        block([logits2, kv_cache2, position_offset2, cur_ids2])
+        options = jax.profiler.ProfileOptions()
+        options.python_tracer_level = 0
+        options.host_tracer_level = 3
+        #with jax.profiler.trace("/tmp/jax-trace1", create_perfetto_link=True):
+        profile = False
+        if profile:
+            jax.profiler.start_trace("/tmp/jax-trace1")#, profiler_options=options)
+
+        [logits2, kv_cache2, position_offset2, cur_ids2], seq = compiled_gen(logits, kv_cache, cur_ids)
+        block([logits2, kv_cache2, position_offset2, cur_ids2, seq])
         fin = time.time()
         del logits2, kv_cache2, position_offset2, cur_ids2
-        print(f"time: {fin-stt}")
+        tps = max_new_tokens / (fin-stt) 
+        print(f"time: {fin-stt} for {max_new_tokens} at {tps} tok/s")
         gc.collect()
+
+        if profile:
+            jax.profiler.stop_trace()
     else:
         for i in tqdm(range(max_new_tokens), desc="Generating"):
             [logits, kv_cache, position_offset, cur_ids], _ = f([logits, kv_cache, position_offset, cur_ids], None)
@@ -373,4 +393,7 @@ def generate_kv_optimized(model, idx, max_new_tokens, context_size, temperature=
         logits, kv_cache, position_offset = qwen3_forward_kv(params, next_token[:, None], cfg, kv_cache, position_offset)
         '''
     
-    return cur_ids
+    #return cur_ids
+    #print(cur_ids)
+    #print(jnp.stack(seq,axis=-1))
+    return jnp.stack(seq, axis=-1)

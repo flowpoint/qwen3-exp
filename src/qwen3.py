@@ -1,7 +1,7 @@
 import jax
 import jax.numpy as jnp
 from tokenizers import Tokenizer
-import torch
+#import torch
 from safetensors.numpy import load_file 
 import os
 from pathlib import Path
@@ -19,13 +19,15 @@ except ImportError:
 os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'true'
 os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.95'
 os.environ['JAX_ENABLE_COMPILATION_CACHE'] = 'false'
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+#os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 os.environ['JAX_PLATFORMS'] = 'gpu'
 
+'''
 os.environ['XLA_FLAGS'] = (
     '--xla_gpu_triton_gemm_any=True '
     '--xla_gpu_enable_latency_hiding_scheduler=true '
 )
+'''
 
 '''
 if jax.default_backend() == 'gpu':
@@ -83,9 +85,11 @@ def batch_convert_numpy_weights(numpy_weights_dict):
     return jax.tree.map(lambda x: jax.device_put(x.astype(jnp.bfloat16), device), converted)
 
 def cleanup_memory():
+    '''
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
+    '''
     gc.collect()
 
 
@@ -214,7 +218,9 @@ if __name__ == "__main__":
     tokenizer_path = model_path / "tokenizer.json"
     tokenizer = Qwen3Tokenizer(str(tokenizer_path) if tokenizer_path.exists() else "tokenizer.json", repo_id=HF_REPO_ID)
 
-    prompt = "Give me a short introduction to large language models."
+    #pref_mul = 20_000
+    pref_mul = 1
+    prompt = "Give me a short introduction to large language models."*pref_mul
     input_ids = tokenizer.encode(prompt)
     if len(input_ids) > QWEN3_CONFIG["context_length"]:
         input_ids = input_ids[:QWEN3_CONFIG["context_length"]]
@@ -235,7 +241,7 @@ if __name__ == "__main__":
     
     # Generate with optimized function (batch_size=1 for single sequence)
     output_token_ids = generate_kv_optimized(
-        model=model, idx=input_token_ids, max_new_tokens=1000,
+        model=model, idx=input_token_ids, max_new_tokens=20,
         context_size=QWEN3_CONFIG["context_length"], top_k=1,
         temperature=0, eos_id=None
     )
