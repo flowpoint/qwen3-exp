@@ -12,7 +12,7 @@ from tqdm import tqdm
 
 from functools import partial, reduce
 
-use_gpu = True
+use_gpu = False
 if use_gpu and jax.default_backend() == 'gpu':
     device =  jax.devices('gpu')[0]
 else:
@@ -23,13 +23,13 @@ def feedforward_forward(params, x):
     up = jnp.einsum('bse,eh->bsh', x, params["up_proj"])
     return jnp.einsum('bsh,he->bse', gate * up, params["down_proj"])
 
-dtype = jax.dtypes.bfloat16
+#dtype = jax.dtypes.bfloat16
 #dtype = jnp.float16
-#dtype = jnp.float32
+dtype = jnp.float32
 cl = 40960
 #cl = 1024
 #cl = 27
-#cl = 1024*16
+#cl = 1024*8
 
 cfg = {
     "vocab_size": 151936, "context_length": cl, "emb_dim": 1024, "n_heads": 16,
@@ -113,8 +113,6 @@ def grouped_query_attention_forward_kv_pre(num_heads, num_kv_groups, head_dim, c
     keys_expanded = jnp.repeat(keys, group_size, axis=1)
     values_expanded = jnp.repeat(values, group_size, axis=1)
     
-    print(queries.shape)
-    print(keys_expanded.shape)
     attn_scores = jnp.einsum('bnqh,bnkh->bnqk', queries, keys_expanded) / jnp.sqrt(head_dim)
     
     if position_offset == 0:
@@ -212,7 +210,7 @@ def qwen3_forward_kv(params, x, cfg, kv_cache, position_offset):
     return logits, new_cache, position_offset_new
 
 
-def qwen3_forward_kv_pre(params, x, cfg, kv_cache, position_offset):
+def qwen3_forward_kv_pre_unchunk(params, x, cfg, kv_cache, position_offset):
     x = params["tok_emb"][x]
     mask = jnp.triu(jnp.ones((cfg["context_length"], cfg["context_length"]), dtype=bool), k=1)
     
@@ -229,6 +227,92 @@ def qwen3_forward_kv_pre(params, x, cfg, kv_cache, position_offset):
     logits = jnp.einsum('bse,ev->bsv', x, params["out_head"])
     
     return logits, new_cache, position_offset_new
+
+def get_logits_old(cfg, x, params):
+    logits_chunks = []
+    seq_chunk_size = 1
+    for chunk_start in range(0, cfg["context_length"], seq_chunk_size):
+        chunk_end = min(chunk_start + seq_chunk_size, cfg["context_length"])
+        x_chunk = x[:, chunk_start:chunk_end]
+        print(x_chunk.shape)
+        print(params['out_head'].shape)
+        logits_chunk = jnp.einsum('bse,ev->bsv', x_chunk, params["out_head"])
+        logits_chunks.append(logits_chunk)
+    
+    logits = jnp.concatenate(logits_chunks, axis=1)
+    return logits
+
+def get_logits(cfg, x, params, vocab_chunk_size=128):
+    """Chunked version of get_logits across the vocab/embedding dimension"""
+    logits_chunks = []
+    seq_chunk_size = 1
+    
+    for chunk_start in range(0, cfg["context_length"], seq_chunk_size):
+        chunk_end = min(chunk_start + seq_chunk_size, cfg["context_length"])
+        x_chunk = x[:, chunk_start:chunk_end]
+        
+        vocab_chunks = []
+        vocab_size = params['out_head'].shape[0]
+        
+        for vocab_chunk_start in range(0, vocab_size, vocab_chunk_size):
+            vocab_chunk_end = min(vocab_chunk_start + vocab_chunk_size, vocab_size)
+            #print('--')
+            #print(params['out_head'].shape)
+            out_head_chunk = params["out_head"][:, vocab_chunk_start:vocab_chunk_end]
+            #print(x_chunk.shape)
+            #print(out_head_chunk.shape)
+            logits_chunk = jnp.einsum('bse,ev->bsv', x_chunk, out_head_chunk)
+            vocab_chunks.append(logits_chunk)
+        
+        # Concatenate vocab chunks for this sequence chunk
+        logits_seq_chunk = jnp.concatenate(vocab_chunks, axis=2)
+        logits_chunks.append(logits_seq_chunk)
+    
+    logits = jnp.concatenate(logits_chunks, axis=1)
+    return logits
+
+
+#@partial(jax.jit, static_argnums=[0,1,])
+def chunk_seq(context_length, seq_chunk_size, params, kv_cache, position_offset, x):
+    mask = jnp.triu(jnp.ones((context_length, context_length), dtype=bool), k=1)
+    
+    new_cache = {"keys": [], "values": []}
+
+    # Process sequence in chunks
+    for chunk_start in range(0, context_length, seq_chunk_size):
+        chunk_end = min(chunk_start + seq_chunk_size, context_length)
+        
+        # Process only the current chunk
+        chunk_mask = mask[chunk_start:chunk_end, :chunk_end]
+        
+        for i, block_params in enumerate(params["trf_blocks"]):
+            layer_cache = {"keys": kv_cache["keys"][:, i], "values": kv_cache["values"][:, i]}
+            
+            # Process chunk with updated position offset
+            x_chunk = x[:, chunk_start:chunk_end]
+            x_chunk, updated_cache, position_offset_new = transformer_block_forward_kv_pre(
+                block_params, chunk_mask, params["cos"], params["sin"], layer_cache, position_offset, x_chunk
+            )
+            
+            # Update cache for this chunk
+            kv_cache['keys'] = kv_cache['keys'].at[:, i].set(updated_cache['keys'])
+            kv_cache['values'] = kv_cache['values'].at[:, i].set(updated_cache['values'])
+            
+            # Update x with chunk results
+            x = x.at[:, chunk_start:chunk_end].set(x_chunk)
+    new_cache = kv_cache
+    return x, new_cache
+
+def qwen3_forward_kv_pre(params, x, cfg, kv_cache, position_offset, seq_chunk_size=1024*4):
+    """Chunked version of qwen3_forward_kv_pre with sequence dimension processing"""
+    x = params["tok_emb"][x]
+    x, new_cache = chunk_seq(cfg['context_length'], seq_chunk_size,params, kv_cache, position_offset,x)
+    
+    x = rmsnorm_forward(params["final_norm"], x)
+    #logits = jnp.einsum('bse,ev->bsv', x, params["out_head"])
+    logits = get_logits(cfg, x, params)
+    
+    return logits, new_cache, position_offset + 1
 
 
 def steptop(params, cfg):
@@ -304,7 +388,6 @@ def generate_kv_optimized(model, idx, max_new_tokens, context_size, temperature=
     
     # prefill1
     logits, kv_cache, position_offset = qwen3_forward_kv_pre(params, cur_ids, cfg, kv_cache, position_offset)
-    exit()
 
     # get generation function
     f = steptop(params, cfg)
@@ -316,7 +399,6 @@ def generate_kv_optimized(model, idx, max_new_tokens, context_size, temperature=
     cur_ids2 = jnp.array([[999]*26])
 
     #logits, kv_cache, position_offset, cur_ids = gen(f, logits, kv_cache, position_offset, cur_ids2, max_new_tokens)
-    exit()
     traced = jax.jit(gen, static_argnums=[0,3,4]).trace(f, logits, kv_cache, position_offset, max_new_tokens)
     lowered = traced.lower()
     compiled_gen = lowered.compile()
