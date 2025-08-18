@@ -12,7 +12,7 @@ from tqdm import tqdm
 
 from functools import partial, reduce
 
-use_gpu = False
+use_gpu = True
 if use_gpu and jax.default_backend() == 'gpu':
     device =  jax.devices('gpu')[0]
 else:
@@ -23,9 +23,9 @@ def feedforward_forward(params, x):
     up = jnp.einsum('bse,eh->bsh', x, params["up_proj"])
     return jnp.einsum('bsh,he->bse', gate * up, params["down_proj"])
 
-#dtype = jax.dtypes.bfloat16
+dtype = jax.dtypes.bfloat16
 #dtype = jnp.float16
-dtype = jnp.float32
+#dtype = jnp.float32
 cl = 40960
 #cl = 1024
 #cl = 27
@@ -210,27 +210,10 @@ def qwen3_forward_kv(params, x, cfg, kv_cache, position_offset):
     return logits, new_cache, position_offset_new
 
 
-def qwen3_forward_kv_pre_unchunk(params, x, cfg, kv_cache, position_offset):
-    x = params["tok_emb"][x]
-    mask = jnp.triu(jnp.ones((cfg["context_length"], cfg["context_length"]), dtype=bool), k=1)
-    
-    new_cache = {"keys": [], "values":[]}
-    for i, block_params in enumerate(params["trf_blocks"]):
-        layer_cache = {"keys": kv_cache["keys"][:,i], "values": kv_cache["values"][:,i]}
-        x, updated_cache, position_offset_new = transformer_block_forward_kv_pre(block_params, mask, params["cos"], params["sin"], layer_cache, position_offset, x)
-        kv_cache['keys'] = kv_cache['keys'].at[:,i].set(updated_cache['keys'])
-        kv_cache['values'] = kv_cache['values'].at[:,i].set(updated_cache['values'])
-
-    new_cache = kv_cache
-    
-    x = rmsnorm_forward(params["final_norm"], x)
-    logits = jnp.einsum('bse,ev->bsv', x, params["out_head"])
-    
-    return logits, new_cache, position_offset_new
 
 def get_logits_old(cfg, x, params):
     logits_chunks = []
-    seq_chunk_size = 1
+    seq_chunk_size = 1024
     for chunk_start in range(0, cfg["context_length"], seq_chunk_size):
         chunk_end = min(chunk_start + seq_chunk_size, cfg["context_length"])
         x_chunk = x[:, chunk_start:chunk_end]
@@ -301,18 +284,36 @@ def chunk_seq(context_length, seq_chunk_size, params, kv_cache, position_offset,
             # Update x with chunk results
             x = x.at[:, chunk_start:chunk_end].set(x_chunk)
     new_cache = kv_cache
-    return x, new_cache
+    return x, new_cache, position_offset_new
 
-def qwen3_forward_kv_pre(params, x, cfg, kv_cache, position_offset, seq_chunk_size=1024*4):
+def qwen3_forward_kv_pre(params, x, cfg, kv_cache, position_offset, seq_chunk_size=1):
     """Chunked version of qwen3_forward_kv_pre with sequence dimension processing"""
     x = params["tok_emb"][x]
-    x, new_cache = chunk_seq(cfg['context_length'], seq_chunk_size,params, kv_cache, position_offset,x)
+    x, new_cache, position_offset_new = chunk_seq(cfg['context_length'], seq_chunk_size,params, kv_cache, position_offset,x)
     
     x = rmsnorm_forward(params["final_norm"], x)
-    #logits = jnp.einsum('bse,ev->bsv', x, params["out_head"])
-    logits = get_logits(cfg, x, params)
+    logits = jnp.einsum('bse,ev->bsv', x, params["out_head"])
+    #logits = get_logits(cfg, x, params)
     
-    return logits, new_cache, position_offset + 1
+    return logits, new_cache, position_offset 
+
+def qwen3_forward_kv_pre_unchunk(params, x, cfg, kv_cache, position_offset):
+    x = params["tok_emb"][x]
+    mask = jnp.triu(jnp.ones((cfg["context_length"], cfg["context_length"]), dtype=bool), k=1)
+    
+    new_cache = {"keys": [], "values":[]}
+    for i, block_params in enumerate(params["trf_blocks"]):
+        layer_cache = {"keys": kv_cache["keys"][:,i], "values": kv_cache["values"][:,i]}
+        x, updated_cache, position_offset_new = transformer_block_forward_kv_pre(block_params, mask, params["cos"], params["sin"], layer_cache, position_offset, x)
+        kv_cache['keys'] = kv_cache['keys'].at[:,i].set(updated_cache['keys'])
+        kv_cache['values'] = kv_cache['values'].at[:,i].set(updated_cache['values'])
+
+    new_cache = kv_cache
+    
+    x = rmsnorm_forward(params["final_norm"], x)
+    logits = jnp.einsum('bse,ev->bsv', x, params["out_head"])
+    
+    return logits, new_cache, position_offset_new
 
 
 def steptop(params, cfg):
