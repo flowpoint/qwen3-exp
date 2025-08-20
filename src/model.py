@@ -126,6 +126,11 @@ def grouped_query_attention_forward_kv(num_heads, num_kv_groups, head_dim, param
     cos, sin = compute_rope_params(cfg["head_dim"], cfg["rope_base"], cfg["context_length"])
 
     b, seq, d_in = x.shape
+    if seq != 1:
+        prefill = True
+    else: 
+        prefill = False
+
     group_size = num_heads // num_kv_groups
     
     queries = jnp.einsum('bsd,dh->bsh', x, params["W_query"]).reshape(b, seq, num_heads, head_dim).transpose(0,2,1,3)
@@ -147,53 +152,30 @@ def grouped_query_attention_forward_kv(num_heads, num_kv_groups, head_dim, param
         
         kv_cache["keys"] = kv_cache["keys"].at[:,:,:keys.shape[2]].set(keys)
         kv_cache["values"] = kv_cache["values"].at[:,:,:values.shape[2]].set(values)
-        new_cache = kv_cache
-        position_offset_new = keys.shape[2]
         
-        keys_expanded = jnp.repeat(keys, group_size, axis=1)
-        values_expanded = jnp.repeat(values, group_size, axis=1)
-        
-        # unbatch
-        queries = queries[0]
-        keys_expanded = keys_expanded[0]
-        values_expanded = values_expanded[0]
-
-        output = att2(queries, keys_expanded, values_expanded, params['out_proj'], pre, position_offset_new)[None,:]
-
-        return output, new_cache, position_offset_new
     else:
         kv_cache["keys"] = kv_cache["keys"].at[:,:,position_offset].set(keys[:,:,0])
         kv_cache["values"] = kv_cache["values"].at[:,:,position_offset].set(values[:,:,0])
         keys = kv_cache['keys']
         values = kv_cache['values']
 
-        new_cache = kv_cache
+    if pre:
+        position_offset_new = keys.shape[2]
+    else:
         position_offset_new = position_offset + 1
-
-        mask = np.arange(keys.shape[2]) > position_offset + 1
         
-        keys_expanded = jnp.repeat(keys, group_size, axis=1)
-        values_expanded = jnp.repeat(values, group_size, axis=1)
+    new_cache = kv_cache
+    keys_expanded = jnp.repeat(keys, group_size, axis=1)
+    values_expanded = jnp.repeat(values, group_size, axis=1)
 
-        # unbatch
-        queries = queries[0]
-        keys_expanded = keys_expanded[0]
-        values_expanded = values_expanded[0]
+    # unbatch
+    queries = queries[0]
+    keys_expanded = keys_expanded[0]
+    values_expanded = values_expanded[0]
 
-        output = att2(queries, keys_expanded, values_expanded, params['out_proj'], pre, position_offset)[None,:]
-        
-        '''
-        attn_scores = jnp.einsum('bnqh,bnkh->bnqk', queries, keys_expanded) / jnp.sqrt(head_dim)
-        attn_scores = jnp.where(mask, -jnp.float_('inf'), attn_scores)
-        
-        attn_weights = jax.nn.softmax(attn_scores, axis=-1)
-        context = jnp.einsum('bnqk,bnkh->bnqh', attn_weights, values_expanded)
-        context = context.transpose(0,2,1,3).reshape(b, seq, num_heads * head_dim)
-        output = jnp.einsum('bsh,hd->bsd', context, params["out_proj"])
-        #output = att2(queries, keys_expanded, values_expanded, params['out_proj'])[None,:]
-        '''
+    output = att2(queries, keys_expanded, values_expanded, params['out_proj'], pre, position_offset)[None,:]
 
-        return output, new_cache, position_offset_new
+    return output, new_cache, position_offset_new
 
 def rms2(norm1, x):
     return jax.vmap(lambda y: rmsnorm_forward(norm1, y))(x)
