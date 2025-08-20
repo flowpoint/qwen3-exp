@@ -80,8 +80,6 @@ def grouped_query_attention_forward_kv_pre(num_heads, num_kv_groups, head_dim, c
     b, seq, d_in = x.shape
     group_size = num_heads // num_kv_groups
     
-    #assert position_offset == kv_cache["keys"].shape[2], f"{kv_cache['keys'].shape[2]} {position_offset}"
-    
     queries = jnp.einsum('bsd,dh->bsh', x, params["W_query"]).reshape(b, seq, num_heads, head_dim).transpose(0,2,1,3)
     keys = jnp.einsum('bsd,dh->bsh', x, params["W_key"]).reshape(b, seq, num_kv_groups, head_dim).transpose(0,2,1,3)
     values = jnp.einsum('bsd,dh->bsh', x, params["W_value"]).reshape(b, seq, num_kv_groups, head_dim).transpose(0,2,1,3)
@@ -220,68 +218,6 @@ def get_logits(cfg, x, params, vocab_chunk_size=128):
     
     logits = jnp.concatenate(logits_chunks, axis=1)
     return logits
-
-
-#@partial(jax.jit, static_argnums=[0,1,])
-def chunk_seq(context_length, seq_chunk_size, params, kv_cache, position_offset, x):
-    mask = jnp.triu(jnp.ones((context_length, context_length), dtype=bool), k=1)
-    
-    new_cache = {"keys": [], "values": []}
-
-    # Process sequence in chunks
-    for chunk_start in range(0, context_length, seq_chunk_size):
-        chunk_end = min(chunk_start + seq_chunk_size, context_length)
-        
-        # Process only the current chunk
-        chunk_mask = mask[chunk_start:chunk_end, :chunk_end]
-        
-        for i, block_params in enumerate(params["trf_blocks"]):
-            layer_cache = {"keys": kv_cache["keys"][:, i], "values": kv_cache["values"][:, i]}
-            
-            # Process chunk with updated position offset
-            x_chunk = x[:, chunk_start:chunk_end]
-            x_chunk, updated_cache, position_offset_new = transformer_block_forward_kv_pre(
-                block_params, chunk_mask, params["cos"], params["sin"], layer_cache, position_offset, x_chunk
-            )
-            
-            # Update cache for this chunk
-            kv_cache['keys'] = kv_cache['keys'].at[:, i].set(updated_cache['keys'])
-            kv_cache['values'] = kv_cache['values'].at[:, i].set(updated_cache['values'])
-            
-            # Update x with chunk results
-            x = x.at[:, chunk_start:chunk_end].set(x_chunk)
-    new_cache = kv_cache
-    return x, new_cache, position_offset_new
-
-def qwen3_forward_kv_pre(params, x, cfg, kv_cache, position_offset, seq_chunk_size=1):
-    """Chunked version of qwen3_forward_kv_pre with sequence dimension processing"""
-    x = params["tok_emb"][x]
-    x, new_cache, position_offset_new = chunk_seq(cfg['context_length'], seq_chunk_size,params, kv_cache, position_offset,x)
-    
-    x = rmsnorm_forward(params["final_norm"], x)
-    logits = jnp.einsum('bse,ev->bsv', x, params["out_head"])
-    #logits = get_logits(cfg, x, params)
-    
-    return logits, new_cache, position_offset 
-
-def qwen3_forward_kv_pre_unchunk(params, x, cfg, kv_cache, position_offset):
-    x = params["tok_emb"][x]
-    mask = jnp.triu(jnp.ones((cfg["context_length"], cfg["context_length"]), dtype=bool), k=1)
-    
-    new_cache = {"keys": [], "values":[]}
-    for i, block_params in enumerate(params["trf_blocks"]):
-        layer_cache = {"keys": kv_cache["keys"][:,i], "values": kv_cache["values"][:,i]}
-        x, updated_cache, position_offset_new = transformer_block_forward_kv_pre(block_params, mask, params["cos"], params["sin"], layer_cache, position_offset, x)
-        kv_cache['keys'] = kv_cache['keys'].at[:,i].set(updated_cache['keys'])
-        kv_cache['values'] = kv_cache['values'].at[:,i].set(updated_cache['values'])
-
-    new_cache = kv_cache
-    
-    x = rmsnorm_forward(params["final_norm"], x)
-    logits = jnp.einsum('bse,ev->bsv', x, params["out_head"])
-    print(logits.shape)
-    
-    return logits, new_cache, position_offset_new
 
 
 def qwen3_forward_kv(params, x, cfg, kv_cache, position_offset, pre=False):

@@ -45,19 +45,12 @@ n_kv_groups = cfg['n_kv_groups']
 head_dim = cfg['head_dim']
 kv_cache = {"keys": jnp.zeros((1, n_layers, n_kv_groups, context_size, head_dim), dtype=dtype), 
              "values": jnp.zeros((1, n_layers, n_kv_groups, context_size, head_dim),dtype=dtype)} 
-csk = reduce(operator.mul, kv_cache['keys'].shape)
-csv = reduce(operator.mul, kv_cache['values'].shape)
-fs = csk+csv
-prec_factor = 2 # for bfloat16 or float16
-fs_gb = (fs / 1_000_000_000) * prec_factor
-
-print(f"cache size is: {fs}")
-print(f"cache size is: {fs_gb} GB")
 position_offset = 0
 
 # prefill1
 logits2, kv_cache2, position_offset2 = qwen3_forward_kv(params, cur_ids, cfg, kv_cache, position_offset,pre=True)
 
+'''
 logits, kv_cache, position_offset = qwen3_forward_kv(params, cur_ids, cfg, kv_cache, position_offset,pre=False)
 #for i in range(cur_ids.shape[1]):
 #logits, kv_cache, position_offset = qwen3_forward_kv(params, cur_ids, cfg, kv_cache, position_offset)
@@ -65,6 +58,7 @@ print('---')
 print(kv_cache2 == kv_cache)
 print(logits2 == logits)
 print(position_offset2 == position_offset)
+'''
 
 '''
 x = cur_ids
@@ -75,3 +69,26 @@ b = qwen3_forward_kv_pre(params, x, cfg, kv_cache, position_offset)
 print(b)
 
 '''
+
+#def grouped_query_attention_forward_kv(num_heads, num_kv_groups, head_dim, cos, sin, params, kv_cache, qk_norm, position_offset, x):
+
+num_heads = cfg['n_heads']
+num_kv_groups = cfg['n_kv_groups']
+head_dim = cfg['head_dim']
+cos, sin = params['cos'], params['sin']
+qk_norm = True
+x = jnp.ones([1,26],dtype=jnp.int64)
+x = params["tok_emb"][x]
+
+attn_params = params['trf_blocks'][0]['att']
+print('-----')
+
+layer_cache = {"keys":kv_cache['keys'][:,0], "values":kv_cache["values"][:,0]}
+
+out1 = grouped_query_attention_forward_kv_pre(num_heads, num_kv_groups, head_dim, cos, sin, attn_params, layer_cache, qk_norm, position_offset, x)
+
+out2 = grouped_query_attention_forward_kv(num_heads, num_kv_groups, head_dim, cos, sin, attn_params, layer_cache, qk_norm, position_offset, x)
+
+out1 == out2
+
+#grouped_query_attention_forward_kv(cfg["n_heads"], cfg["n_kv_groups"], cfg["head_dim"], cos, sin, params["att"], kv_cache, cfg["qk_norm"], position_offset, x)
