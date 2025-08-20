@@ -56,11 +56,22 @@ print(f"cache size is: {fs_gb} GB")
 position_offset = 0
 
 # prefill1
-#logits, kv_cache, position_offset = qwen3_forward_kv_pre(params, cur_ids, cfg, kv_cache, position_offset)
+logits2, kv_cache2, position_offset2 = qwen3_forward_kv(params, cur_ids, cfg, kv_cache, position_offset,pre=True)
 
+logits, kv_cache, position_offset = qwen3_forward_kv(params, cur_ids, cfg, kv_cache, position_offset,pre=False)
+#for i in range(cur_ids.shape[1]):
+#logits, kv_cache, position_offset = qwen3_forward_kv(params, cur_ids, cfg, kv_cache, position_offset)
+print('---')
+print(kv_cache2 == kv_cache)
+print(logits2 == logits)
+print(position_offset2 == position_offset)
+
+'''
 x = cur_ids
 
 a = qwen3_forward_kv_pre_unchunk(params, x, cfg, kv_cache, position_offset)
 print(a)
 b = qwen3_forward_kv_pre(params, x, cfg, kv_cache, position_offset)
 print(b)
+
+'''

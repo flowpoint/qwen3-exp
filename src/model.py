@@ -57,17 +57,6 @@ def apply_rope(x, cos, sin):
     rotated = jnp.concatenate([-x2, x1], axis=-1)
     return ((x * cos) + (rotated * sin)).astype(dtype)
 
-def apply_rope_with_offset_pre(x, cos, sin, position_offset=0):
-    seq_len = x.shape[2]
-    x1, x2 = x[..., :x.shape[-1]//2], x[..., x.shape[-1]//2:]
-    
-    positions = jnp.arange(position_offset, position_offset + seq_len)
-    cos_slice = cos[positions, :][None, None, :, :]
-    sin_slice = sin[positions, :][None, None, :, :]
-    
-    rotated = jnp.concatenate([-x2, x1], axis=-1)
-    return ((x * cos_slice) + (rotated * sin_slice)).astype(dtype)
-
 def apply_rope_with_offset(x, cos, sin, position_offset=0):
     seq_len = x.shape[2]
     x1, x2 = x[..., :x.shape[-1]//2], x[..., x.shape[-1]//2:]
@@ -85,7 +74,9 @@ def apply_qk_norm(x, norm_params):
     x_normed = rmsnorm_forward(norm_params, x_reshaped)
     return x_normed.reshape(b, h, s, d)
 
-def grouped_query_attention_forward_kv_pre(num_heads, num_kv_groups, head_dim, cos, sin, params, mask,  kv_cache, qk_norm, position_offset, x):
+def grouped_query_attention_forward_kv_pre(num_heads, num_kv_groups, head_dim, cos, sin, params, kv_cache, qk_norm, position_offset, x):
+
+    mask = jnp.triu(jnp.ones((cfg["context_length"], cfg["context_length"]), dtype=bool), k=1)
     b, seq, d_in = x.shape
     group_size = num_heads // num_kv_groups
     
@@ -99,8 +90,8 @@ def grouped_query_attention_forward_kv_pre(num_heads, num_kv_groups, head_dim, c
         queries = apply_qk_norm(queries, params["q_norm"])
         keys = apply_qk_norm(keys, params["k_norm"])
 
-    queries = apply_rope_with_offset_pre(queries, cos, sin, position_offset)
-    keys = apply_rope_with_offset_pre(keys, cos, sin, position_offset)
+    queries = apply_rope_with_offset(queries, cos, sin, position_offset)
+    keys = apply_rope_with_offset(keys, cos, sin, position_offset)
     
     keys = jnp.concatenate([kv_cache["keys"][:,:, :position_offset], keys], axis=2)
     values = jnp.concatenate([kv_cache["values"][:,:,:position_offset], values], axis=2)
@@ -172,42 +163,18 @@ def grouped_query_attention_forward_kv(num_heads, num_kv_groups, head_dim, cos, 
 def rms2(norm1, x):
     return jax.vmap(lambda y: rmsnorm_forward(norm1, y))(x)
 
-def transformer_block_forward_kv(params, cos, sin, kv_cache, position_offset, x):
+def transformer_block_forward_kv(params, cos, sin, kv_cache, position_offset, x, pre=False):
     shortcut = x
     x = rmsnorm_forward(params["norm1"], x)
-    x, new_cache, position_offset = grouped_query_attention_forward_kv(cfg["n_heads"], cfg["n_kv_groups"], cfg["head_dim"], cos, sin, params["att"], kv_cache, cfg["qk_norm"], position_offset, x)
+    if pre:
+        x, new_cache, position_offset = grouped_query_attention_forward_kv_pre(cfg["n_heads"], cfg["n_kv_groups"], cfg["head_dim"], cos, sin, params["att"], kv_cache, cfg["qk_norm"], position_offset, x)
+    else:
+        x, new_cache, position_offset = grouped_query_attention_forward_kv(cfg["n_heads"], cfg["n_kv_groups"], cfg["head_dim"], cos, sin, params["att"], kv_cache, cfg["qk_norm"], position_offset, x)
     x = x + shortcut
     shortcut = x
     x = rmsnorm_forward(params["norm2"], x)
     x = feedforward_forward(params["ff"], x)
     return x + shortcut, new_cache, position_offset
-
-def transformer_block_forward_kv_pre(params, mask, cos, sin, kv_cache, position_offset, x):
-    shortcut = x
-    x = rmsnorm_forward(params["norm1"], x)
-    x, new_cache, position_offset = grouped_query_attention_forward_kv_pre(cfg["n_heads"], cfg["n_kv_groups"], cfg["head_dim"], cos, sin, params["att"], mask,  kv_cache, cfg["qk_norm"], position_offset, x)
-    x = x + shortcut
-    shortcut = x
-    x = rmsnorm_forward(params["norm2"], x)
-    x = feedforward_forward(params["ff"], x)
-    return x + shortcut, new_cache, position_offset
-
-
-def qwen3_forward_kv(params, x, cfg, kv_cache, position_offset):
-    x = params["tok_emb"][x]
-
-    new_cache = {"keys": [], "values":[]}
-    for i, block_params in enumerate(params["trf_blocks"]):
-        layer_cache = {"keys": kv_cache["keys"][:,i], "values": kv_cache["values"][:,i]}
-        x, updated_cache, position_offset_new = transformer_block_forward_kv(block_params, params["cos"], params["sin"], layer_cache, position_offset, x)
-        kv_cache['keys'] = kv_cache['keys'].at[:,i].set(updated_cache['keys'])
-        kv_cache['values'] = kv_cache['values'].at[:,i].set(updated_cache['values'])
-    new_cache = kv_cache
-
-    x = rmsnorm_forward(params["final_norm"], x)
-    logits = jnp.einsum('bse,ev->bsv', x, params["out_head"])
-    
-    return logits, new_cache, position_offset_new
 
 
 
@@ -312,6 +279,24 @@ def qwen3_forward_kv_pre_unchunk(params, x, cfg, kv_cache, position_offset):
     
     x = rmsnorm_forward(params["final_norm"], x)
     logits = jnp.einsum('bse,ev->bsv', x, params["out_head"])
+    print(logits.shape)
+    
+    return logits, new_cache, position_offset_new
+
+
+def qwen3_forward_kv(params, x, cfg, kv_cache, position_offset, pre=False):
+    x = params["tok_emb"][x]
+
+    new_cache = {"keys": [], "values":[]}
+    for i, block_params in enumerate(params["trf_blocks"]):
+        layer_cache = {"keys": kv_cache["keys"][:,i], "values": kv_cache["values"][:,i]}
+        x, updated_cache, position_offset_new = transformer_block_forward_kv(block_params, params["cos"], params["sin"], layer_cache, position_offset, x, pre=pre)
+        kv_cache['keys'] = kv_cache['keys'].at[:,i].set(updated_cache['keys'])
+        kv_cache['values'] = kv_cache['values'].at[:,i].set(updated_cache['values'])
+    new_cache = kv_cache
+
+    x = rmsnorm_forward(params["final_norm"], x)
+    logits = jnp.einsum('bse,ev->bsv', x, params["out_head"])
     
     return logits, new_cache, position_offset_new
 
@@ -388,7 +373,7 @@ def generate_kv_optimized(model, idx, max_new_tokens, context_size, temperature=
     position_offset = 0
     
     # prefill1
-    logits, kv_cache, position_offset = qwen3_forward_kv_pre(params, cur_ids, cfg, kv_cache, position_offset)
+    logits, kv_cache, position_offset = qwen3_forward_kv(params, cur_ids, cfg, kv_cache, position_offset, pre=True)
 
     # get generation function
     f = steptop(params, cfg)
