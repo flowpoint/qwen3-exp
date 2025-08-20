@@ -86,20 +86,6 @@ def manual_vmap(fn, *args):
 
     return jnp.stack(outputs)
 
-'''
-def att_head(queries, keys_expanded, values_expanded, position_offset):
-    #attn_scores = jnp.einsum('qh,kh->qk', queries, keys_expanded) / jnp.sqrt(head_dim)
-    attn_scores = jnp.matmul(queries, keys_expanded.transpose(1,0)) / jnp.sqrt(cfg['head_dim'])
-
-    mask = np.arange(attn_scores.shape[-1]) > position_offset + 1
-    attn_scores = jnp.where(mask, -jnp.float_('inf'), attn_scores)
-
-    
-    attn_weights = jax.nn.softmax(attn_scores, axis=-1)
-    #context = jnp.einsum('qk,kh->qh', attn_weights, values_expanded)
-    context = jnp.matmul(attn_weights.transpose(1,0), values_expanded)
-    return context
-'''
 
 def att_head(queries, keys_expanded, values_expanded):
     #attn_scores = jnp.einsum('qh,kh->qk', queries, keys_expanded) / jnp.sqrt(head_dim)
@@ -128,7 +114,9 @@ def att2(queries, keys_expanded, values_expanded, out_proj):
     return output
 
 
-def grouped_query_attention_forward_kv_pre(num_heads, num_kv_groups, head_dim, cos, sin, params, kv_cache, qk_norm, position_offset, x):
+def grouped_query_attention_forward_kv_pre(num_heads, num_kv_groups, head_dim, params, kv_cache, qk_norm, position_offset, x):
+    cos, sin = compute_rope_params(cfg["head_dim"], cfg["rope_base"], cfg["context_length"])
+
     b, seq, d_in = x.shape
     group_size = num_heads // num_kv_groups
     
@@ -164,10 +152,12 @@ def grouped_query_attention_forward_kv_pre(num_heads, num_kv_groups, head_dim, c
     return output, new_cache, position_offset_new
 
 #@partial(jax.jit, static_argnums=[0,1,2,7,])
-def grouped_query_attention_forward_kv(num_heads, num_kv_groups, head_dim, cos, sin, params, kv_cache, qk_norm, position_offset, x):
+def grouped_query_attention_forward_kv(num_heads, num_kv_groups, head_dim, params, kv_cache, qk_norm, position_offset, x):
+    cos, sin = compute_rope_params(cfg["head_dim"], cfg["rope_base"], cfg["context_length"])
+
     b, seq, d_in = x.shape
-    #print(x.shape)
     group_size = num_heads // num_kv_groups
+
     
     queries = jnp.einsum('bsd,dh->bsh', x, params["W_query"]).reshape(b, seq, num_heads, head_dim).transpose(0,2,1,3)
     keys = jnp.einsum('bsd,dh->bsh', x, params["W_key"]).reshape(b, seq, num_kv_groups, head_dim).transpose(0,2,1,3)
@@ -209,13 +199,13 @@ def grouped_query_attention_forward_kv(num_heads, num_kv_groups, head_dim, cos, 
 def rms2(norm1, x):
     return jax.vmap(lambda y: rmsnorm_forward(norm1, y))(x)
 
-def transformer_block_forward_kv(params, cos, sin, kv_cache, position_offset, x, pre=False):
+def transformer_block_forward_kv(params, kv_cache, position_offset, x, pre=False):
     shortcut = x
     x = rmsnorm_forward(params["norm1"], x)
     if pre:
-        x, new_cache, position_offset = grouped_query_attention_forward_kv_pre(cfg["n_heads"], cfg["n_kv_groups"], cfg["head_dim"], cos, sin, params["att"], kv_cache, cfg["qk_norm"], position_offset, x)
+        x, new_cache, position_offset = grouped_query_attention_forward_kv_pre(cfg["n_heads"], cfg["n_kv_groups"], cfg["head_dim"], params["att"], kv_cache, cfg["qk_norm"], position_offset, x)
     else:
-        x, new_cache, position_offset = grouped_query_attention_forward_kv(cfg["n_heads"], cfg["n_kv_groups"], cfg["head_dim"], cos, sin, params["att"], kv_cache, cfg["qk_norm"], position_offset, x)
+        x, new_cache, position_offset = grouped_query_attention_forward_kv(cfg["n_heads"], cfg["n_kv_groups"], cfg["head_dim"], params["att"], kv_cache, cfg["qk_norm"], position_offset, x)
     x = x + shortcut
     shortcut = x
     x = rmsnorm_forward(params["norm2"], x)
@@ -274,7 +264,7 @@ def qwen3_forward_kv(params, x, cfg, kv_cache, position_offset, pre=False):
     new_cache = {"keys": [], "values":[]}
     for i, block_params in enumerate(params["trf_blocks"]):
         layer_cache = {"keys": kv_cache["keys"][:,i], "values": kv_cache["values"][:,i]}
-        x, updated_cache, position_offset_new = transformer_block_forward_kv(block_params, params["cos"], params["sin"], layer_cache, position_offset, x, pre=pre)
+        x, updated_cache, position_offset_new = transformer_block_forward_kv(block_params, layer_cache, position_offset, x, pre=pre)
         kv_cache['keys'] = kv_cache['keys'].at[:,i].set(updated_cache['keys'])
         kv_cache['values'] = kv_cache['values'].at[:,i].set(updated_cache['values'])
     new_cache = kv_cache
