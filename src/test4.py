@@ -69,15 +69,18 @@ b = qwen3_forward_kv_pre(params, x, cfg, kv_cache, position_offset)
 print(b)
 
 '''
+max_seq = 40960
+#max_seq = 26
+#max_seq = 1024
 
-#def grouped_query_attention_forward_kv(num_heads, num_kv_groups, head_dim, cos, sin, params, kv_cache, qk_norm, position_offset, x):
 
 num_heads = cfg['n_heads']
 num_kv_groups = cfg['n_kv_groups']
 head_dim = cfg['head_dim']
 cos, sin = params['cos'], params['sin']
 qk_norm = True
-x = jnp.ones([1,26],dtype=jnp.int64)
+
+x = jnp.ones([1,max_seq],dtype=jnp.int64)
 x = params["tok_emb"][x]
 
 attn_params = params['trf_blocks'][0]['att']
@@ -87,8 +90,36 @@ layer_cache = {"keys":kv_cache['keys'][:,0], "values":kv_cache["values"][:,0]}
 
 out1 = grouped_query_attention_forward_kv_pre(num_heads, num_kv_groups, head_dim, cos, sin, attn_params, layer_cache, qk_norm, position_offset, x)
 
+print('pass1')
+
 out2 = grouped_query_attention_forward_kv(num_heads, num_kv_groups, head_dim, cos, sin, attn_params, layer_cache, qk_norm, position_offset, x)
 
-out1 == out2
+'''
+#jnp.all(out1 == out2)
 
 #grouped_query_attention_forward_kv(cfg["n_heads"], cfg["n_kv_groups"], cfg["head_dim"], cos, sin, params["att"], kv_cache, cfg["qk_norm"], position_offset, x)
+
+
+keys_expanded = jnp.ones([1, 16, max_seq, 128])
+queries = jnp.ones([1, 16, max_seq, 128])
+
+print(keys_expanded.shape)
+attn_scores = jnp.einsum('bnqh,bnkh->bnqk', queries, keys_expanded) / jnp.sqrt(head_dim)
+
+#print(params['out_proj'])
+'''
+
+'''
+if position_offset == 0:
+    q_len, k_len = queries.shape[2], keys.shape[2]
+    causal_mask = jnp.triu(jnp.ones((q_len, k_len)), k=1)
+    attn_scores = jnp.where(causal_mask[None, None, :, :], -jnp.inf, attn_scores)
+
+attn_weights = jax.nn.softmax(attn_scores, axis=-1)
+context = jnp.einsum('bnqk,bnkh->bnqh', attn_weights, values_expanded)
+context = context.transpose(0,2,1,3).reshape(b, seq, num_heads * head_dim)
+output = jnp.einsum('bsh,hd->bsd', context, params["out_proj"])
+
+return output, new_cache, position_offset_new
+'''
+

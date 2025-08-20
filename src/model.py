@@ -74,9 +74,48 @@ def apply_qk_norm(x, norm_params):
     x_normed = rmsnorm_forward(norm_params, x_reshaped)
     return x_normed.reshape(b, h, s, d)
 
-def grouped_query_attention_forward_kv_pre(num_heads, num_kv_groups, head_dim, cos, sin, params, kv_cache, qk_norm, position_offset, x):
 
-    mask = jnp.triu(jnp.ones((cfg["context_length"], cfg["context_length"]), dtype=bool), k=1)
+def manual_vmap(fn, *args):
+    dim1 = args[0].shape[0]
+    outputs = []
+    for i in range(dim1):
+        inputs_i = [arg[i] for arg in args]  # Grab the i-th slice from each arg
+        out = fn(*inputs_i)
+        outputs.append(out)
+
+    return jnp.stack(outputs)
+
+def att_head(queries, keys_expanded, values_expanded, position_offset):
+    #attn_scores = jnp.einsum('qh,kh->qk', queries, keys_expanded) / jnp.sqrt(head_dim)
+    attn_scores = jnp.matmul(queries, keys_expanded.transpose(1,0)) / jnp.sqrt(cfg['head_dim'])
+
+    '''
+    if position_offset == 0:
+        q_len, k_len = queries.shape[1], keys_expanded.shape[1]
+        causal_mask = jnp.triu(jnp.ones((q_len, k_len)), k=1)
+        attn_scores = jnp.where(causal_mask[None, :, :], -jnp.inf, attn_scores)
+    '''
+
+    mask = np.arange(attn_scores.shape[-1]) > position_offset + 1
+    attn_scores = jnp.where(mask, -jnp.float_('inf'), attn_scores)
+
+    
+    attn_weights = jax.nn.softmax(attn_scores, axis=-1)
+    #context = jnp.einsum('qk,kh->qh', attn_weights, values_expanded)
+    context = jnp.matmul(attn_weights.transpose(1,0), values_expanded)
+    return context
+
+#partial(jax.jit, static_argnums=[])
+def att2(queries, keys_expanded, values_expanded, out_proj, position_offset):
+    #context = jax.vmap(att_head, in_axes=(0,0,0))(queries, keys_expanded, values_expanded)
+    #context = chunked_vmap(att_head, queries, keys_expanded, values_expanded, chunk_size=chunk_size)
+    context = manual_vmap(att_head, queries, keys_expanded, values_expanded, [position_offset]*queries.shape[0] )
+
+    context = context.transpose(1,0,2).reshape(queries.shape[1], cfg['n_heads'] * cfg['head_dim'])
+    output = jnp.einsum('sh,hd->sd', context, out_proj)
+    return output
+
+def grouped_query_attention_forward_kv_pre(num_heads, num_kv_groups, head_dim, cos, sin, params, kv_cache, qk_norm, position_offset, x):
     b, seq, d_in = x.shape
     group_size = num_heads // num_kv_groups
     
@@ -102,7 +141,22 @@ def grouped_query_attention_forward_kv_pre(num_heads, num_kv_groups, head_dim, c
     keys_expanded = jnp.repeat(keys, group_size, axis=1)
     values_expanded = jnp.repeat(values, group_size, axis=1)
     
-    attn_scores = jnp.einsum('bnqh,bnkh->bnqk', queries, keys_expanded) / jnp.sqrt(head_dim)
+    queries = queries[0]
+    keys_expanded = keys_expanded[0]
+    '''
+    values_expanded = values_expanded[0]
+    '''
+    #attn_scores = jnp.einsum('bnqh,bnkh->bnqk', queries, keys_expanded) / jnp.sqrt(head_dim)
+    def head(queries, keys_expanded):
+        #attn_scores = jnp.einsum('qh,kh->qk', queries, keys_expanded) / jnp.sqrt(head_dim)
+        attn_scores = jnp.matmul(queries, keys_expanded.transpose(1,0)) / jnp.sqrt(cfg['head_dim'])
+        return attn_scores
+
+    attn_scores = manual_vmap(head, queries, keys_expanded)[None, :]
+
+    queries = queries[None, :]
+    keys_expanded = keys_expanded[None, :]
+
     
     if position_offset == 0:
         q_len, k_len = queries.shape[2], keys.shape[2]
@@ -113,6 +167,8 @@ def grouped_query_attention_forward_kv_pre(num_heads, num_kv_groups, head_dim, c
     context = jnp.einsum('bnqk,bnkh->bnqh', attn_weights, values_expanded)
     context = context.transpose(0,2,1,3).reshape(b, seq, num_heads * head_dim)
     output = jnp.einsum('bsh,hd->bsd', context, params["out_proj"])
+
+    #output = att2(queries, keys_expanded, values_expanded, params['out_proj'], position_offset)[None,:]
 
     return output, new_cache, position_offset_new
 
@@ -147,6 +203,7 @@ def grouped_query_attention_forward_kv(num_heads, num_kv_groups, head_dim, cos, 
     
     keys_expanded = jnp.repeat(keys, group_size, axis=1)
     values_expanded = jnp.repeat(values, group_size, axis=1)
+
     
     attn_scores = jnp.einsum('bnqh,bnkh->bnqk', queries, keys_expanded) / jnp.sqrt(head_dim)
     attn_scores = jnp.where(mask, -jnp.float_('inf'), attn_scores)
@@ -155,6 +212,7 @@ def grouped_query_attention_forward_kv(num_heads, num_kv_groups, head_dim, cos, 
     context = jnp.einsum('bnqk,bnkh->bnqh', attn_weights, values_expanded)
     context = context.transpose(0,2,1,3).reshape(b, seq, num_heads * head_dim)
     output = jnp.einsum('bsh,hd->bsd', context, params["out_proj"])
+    #output = att2(queries, keys_expanded, values_expanded, params['out_proj'])[None,:]
 
     return output, new_cache, position_offset_new
 
