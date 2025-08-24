@@ -168,20 +168,12 @@ def att_head_g(queries, keys_expanded, values_expanded):
     m, k = A.shape
     k, n = B.shape
     C = jnp.zeros((m, n))
-    for i in range(0, m, tile_size):
-        for k0 in range(0, k, tile_size):
-            for j in range(0, n, tile_size):
-                a = A[i:i+tile_size, k0:k0+tile_size]
-                b = B[k0:k0+tile_size, j:j+tile_size]
-                C = C.at[i:i+tile_size, j:j+tile_size].add(jnp.matmul(a, b))
-    '''
     # can actually skip tiling over the small 128 (head dimension)
     for i in range(0, m, tile_size):
-            for j in range(0, n, tile_size):
-                a = A[i:i+tile_size]#, k0:k0+tile_size]
-                b = B[:, j:j+tile_size]
-                C = C.at[i:i+tile_size, j:j+tile_size].add(jnp.matmul(a, b))
-    '''
+        for j in range(0, n, tile_size):
+            a = A[i:i+tile_size]#, k0:k0+tile_size]
+            b = B[:, j:j+tile_size]
+            C = C.at[i:i+tile_size, j:j+tile_size].add(jnp.matmul(a, b))
     res = C
     assert jnp.allclose(C, tiled_matmul(queries, B))
     # 40960, 40960
@@ -209,10 +201,9 @@ def att_head_g(queries, keys_expanded, values_expanded):
 
     for i in range(0, m, tile_size):
         for k0 in range(0, k, tile_size):
-            for j in range(0, n, tile_size):
-                a = D[i:i+tile_size, k0:k0+tile_size]
-                b = E[k0:k0+tile_size, j:j+tile_size]
-                F = F.at[i:i+tile_size, j:j+tile_size].add(jnp.matmul(a, b))
+            a = D[i:i+tile_size, k0:k0+tile_size]
+            b = E[k0:k0+tile_size]
+            F = F.at[i:i+tile_size].add(jnp.matmul(a, b))
 
     context = F
     return context
