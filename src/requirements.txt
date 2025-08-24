@@ -1,0 +1,4 @@
+jax[cuda12]
+tokenizers
+transformers
+safetensors

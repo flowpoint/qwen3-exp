@@ -57,11 +57,12 @@ def apply_rope(x, cos, sin):
     rotated = jnp.concatenate([-x2, x1], axis=-1)
     return ((x * cos) + (rotated * sin)).astype(dtype)
 
+@jax.jit
 def apply_rope_with_offset_pre(x, cos, sin, position_offset=0):
     seq_len = x.shape[2]
     x1, x2 = x[..., :x.shape[-1]//2], x[..., x.shape[-1]//2:]
     
-    positions = jnp.arange(position_offset, position_offset + seq_len)
+    positions = jnp.arange(0, 0 + seq_len) + position_offset
     cos_slice = cos[positions, :][None, None, :, :]
     sin_slice = sin[positions, :][None, None, :, :]
     
@@ -85,6 +86,7 @@ def apply_qk_norm(x, norm_params):
     x_normed = rmsnorm_forward(norm_params, x_reshaped)
     return x_normed.reshape(b, h, s, d)
 
+#@jax.jit
 def grouped_query_attention_forward_kv_pre(num_heads, num_kv_groups, head_dim, cos, sin, params, mask,  kv_cache, qk_norm, position_offset, x):
     b, seq, d_in = x.shape
     group_size = num_heads // num_kv_groups
@@ -182,6 +184,8 @@ def transformer_block_forward_kv(params, cos, sin, kv_cache, position_offset, x)
     x = feedforward_forward(params["ff"], x)
     return x + shortcut, new_cache, position_offset
 
+#@partial(jax.jit)
+#@jax.jit
 def transformer_block_forward_kv_pre(params, mask, cos, sin, kv_cache, position_offset, x):
     shortcut = x
     x = rmsnorm_forward(params["norm1"], x)
@@ -225,6 +229,7 @@ def get_logits_old(cfg, x, params):
     logits = jnp.concatenate(logits_chunks, axis=1)
     return logits
 
+@partial(jax.jit, static_argnums=[0,3])
 def get_logits(cfg, x, params, vocab_chunk_size=128):
     """Chunked version of get_logits across the vocab/embedding dimension"""
     logits_chunks = []
@@ -257,6 +262,7 @@ def get_logits(cfg, x, params, vocab_chunk_size=128):
 
 #@partial(jax.jit, static_argnums=[0,1,])
 def chunk_seq(context_length, seq_chunk_size, params, kv_cache, position_offset, x):
+    #print(x.shape)
     mask = jnp.triu(jnp.ones((context_length, context_length), dtype=bool), k=1)
     
     new_cache = {"keys": [], "values": []}
@@ -286,7 +292,7 @@ def chunk_seq(context_length, seq_chunk_size, params, kv_cache, position_offset,
     new_cache = kv_cache
     return x, new_cache, position_offset_new
 
-def qwen3_forward_kv_pre(params, x, cfg, kv_cache, position_offset, seq_chunk_size=1):
+def qwen3_forward_kv_pre(params, x, cfg, kv_cache, position_offset, seq_chunk_size=1024):
     """Chunked version of qwen3_forward_kv_pre with sequence dimension processing"""
     x = params["tok_emb"][x]
     x, new_cache, position_offset_new = chunk_seq(cfg['context_length'], seq_chunk_size,params, kv_cache, position_offset,x)

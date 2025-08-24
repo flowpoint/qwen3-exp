@@ -13,8 +13,8 @@ safetensors_files.sort()
 tokenizer_path = model_path / "tokenizer.json"
 tokenizer = Qwen3Tokenizer(str(tokenizer_path) if tokenizer_path.exists() else "tokenizer.json", repo_id=HF_REPO_ID)
 
-#pref_mul = 20_000
-pref_mul = 1
+pref_mul = 20_000
+#pref_mul = 1
 prompt = "Give me a short introduction to large language models."*pref_mul
 input_ids = tokenizer.encode(prompt)
 if len(input_ids) > QWEN3_CONFIG["context_length"]:
@@ -60,7 +60,27 @@ position_offset = 0
 
 x = cur_ids
 
+def qwen3_forward_kv_pre(params, x, cfg, kv_cache, position_offset, seq_chunk_size=1):
+    """Chunked version of qwen3_forward_kv_pre with sequence dimension processing"""
+    x = params["tok_emb"][x]
+    x, new_cache, position_offset_new = chunk_seq(cfg['context_length'], seq_chunk_size,params, kv_cache, position_offset,x)
+    
+    x = rmsnorm_forward(params["final_norm"], x)
+    logits = jnp.einsum('bse,ev->bsv', x, params["out_head"])
+    #logits = get_logits(cfg, x, params)
+    
+    return logits, new_cache, position_offset 
+
+'''
 a = qwen3_forward_kv_pre_unchunk(params, x, cfg, kv_cache, position_offset)
 print(a)
+'''
 b = qwen3_forward_kv_pre(params, x, cfg, kv_cache, position_offset)
 print(b)
+'''
+
+print(f" comparison")
+
+for ai, bi in zip(a,b):
+    print(ai == bi)
+'''
