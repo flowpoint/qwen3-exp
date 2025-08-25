@@ -158,7 +158,7 @@ def att_head_o(queries, keys_expanded, values_expanded):
     return context
 
 #@jax.jit
-def att_head_g(queries, keys_expanded, values_expanded):
+def att_head_g(queries, keys_expanded, values_expanded, simp=False):
     tile_size = 1024
     # matmul1
     A = queries
@@ -174,14 +174,17 @@ def att_head_g(queries, keys_expanded, values_expanded):
             a = A[i:i+tile_size]#, k0:k0+tile_size]
             b = B[:, j:j+tile_size]
             C = C.at[i:i+tile_size, j:j+tile_size].add(jnp.matmul(a, b))
+            #print((i,j))
     res = C
     assert jnp.allclose(C, tiled_matmul(queries, B))
     # 40960, 40960
 
-    # normalize by head dim
-    attn_scores = res / jnp.sqrt(head_dim)
-    attn_weights = jax.nn.softmax(attn_scores, axis=-1)
-    #attn_weights = attn_scores
+    if simp:
+        attn_weights = res
+    else:
+        # normalize by head dim
+        attn_scores = res / jnp.sqrt(head_dim)
+        attn_weights = jax.nn.softmax(attn_scores, axis=-1)
 
     # softmax
     #set_trace()
@@ -192,8 +195,18 @@ def att_head_g(queries, keys_expanded, values_expanded):
     '''
 
     # matmul2
-    D = attn_weights.transpose(1,0)
+    if simp:
+        D = attn_weights
+    else:
+        D = attn_weights.transpose(1,0)
     E = values_expanded
+
+    '''
+    set_trace()
+    assert m == D.shape[0]
+    assert k == D.shape[1]
+    assert n == E.shape[1]
+    '''
 
     m, k = D.shape
     k, n = E.shape
@@ -208,7 +221,6 @@ def att_head_g(queries, keys_expanded, values_expanded):
     context = F
     return context
 
-#@jax.jit
 def att_head(queries, keys_expanded, values_expanded):
     tile_size = 1024
     # matmul1
@@ -221,61 +233,68 @@ def att_head(queries, keys_expanded, values_expanded):
     attn_scores = jnp.matmul(queries, keys_expanded.transpose(1,0)) / jnp.sqrt(head_dim)
     attn_scores_ref = attn_scores
     attn_weights_ref = jax.nn.softmax(attn_scores, axis=-1)
+    context_ref = jnp.matmul(attn_weights_ref.transpose(1,0), values_expanded)
 
     m, k = A.shape
     k, n = B.shape
-    C = jnp.zeros((m, n))
+    #C = jnp.zeros((m, n))
+    #C = jnp.zeros((m, 128))
     # square in seq dims
     F = jnp.zeros((m, values_expanded.shape[-1]))
+
+    # can actually skip tiling over the small 128 (head dimension)
     for i in range(0, m, tile_size):
-        for k0 in range(0, k, tile_size):
-            for j in range(0, n, tile_size):
-                a = A[i:i+tile_size, k0:k0+tile_size]
-                b = B[k0:k0+tile_size, j:j+tile_size]
-                C = C.at[i:i+tile_size, j:j+tile_size].add(jnp.matmul(a, b))
+        k, n = B.shape
+        for j in range(0, n, tile_size):
+            a = A[i:i+tile_size]#, k0:k0+tile_size]
+            b = B[:, j:j+tile_size]
+            #C = C.at[i:i+tile_size, j:j+tile_size].set(jnp.matmul(a, b))
 
-                res = C
-                #til = C[i:i+tile_size, j:j+tile_size]
+            res_ij = jnp.matmul(a,b)
+            #res_ij = C[i:i+tile_size,j:j+tile_size]
 
-                if not jnp.allclose(mm_ref2[i:i+tile_size], mm_ref[i:i+tile_size]): set_trace()
-                if not jnp.allclose(C[i:i+tile_size, j:j+tile_size], mm_ref[i:i+tile_size, j:j+tile_size]): set_trace()
+            # normalize by head dim
+            attn_scores_ij = res_ij #/ jnp.sqrt(head_dim)
+            #attn_weights = jax.nn.softmax(attn_scores, axis=-1)
 
-                # normalize by head dim
-                attn_scores_ij = res[i:i+tile_size, j:j+tile_size] / jnp.sqrt(head_dim)
-                if not jnp.allclose(attn_scores_ij, attn_scores_ref[i:i+tile_size, j:j+tile_size]): set_trace()
+            #if not jnp.allclose(mm_ref2[i:i+tile_size], mm_ref[i:i+tile_size]): set_trace()
+            #if not jnp.allclose(C[i:i+tile_size, j:j+tile_size], mm_ref[i:i+tile_size, j:j+tile_size]): set_trace()
 
-                #e = jnp.exp(attn_scores)
-                #attn_weights = e / jnp.sum(e, axis=-1)
-                #attn_weights_ij = jax.nn.softmax(attn_scores_ij, axis=-1)
-                attn_weights_ij = attn_scores_ij
-                #if not jnp.allclose(attn_weights_ij, attn_weights_ref[i:i+tile_size,j:j+tile_size]): set_trace()
+            # normalize by head dim
+            #if not jnp.allclose(attn_scores_ij, attn_scores_ref[i:i+tile_size, j:j+tile_size]): set_trace()
 
-                # matmul2
-                D = attn_weights_ij.transpose(1,0)
-                E = values_expanded
+            #attn_weights_ij = jax.nn.softmax(attn_scores_ij, axis=-1)
+            attn_weights_ij = attn_scores_ij
+            #if not jnp.allclose(attn_weights_ij, attn_weights_ref[i:i+tile_size,j:j+tile_size]): set_trace()
 
-                m, k = D.shape
-                k, n = E.shape
+            # matmul2
+            D = attn_weights_ij#.transpose(1,0)
+            E = values_expanded
 
-                #for i in range(0, m, tile_size):
-                #for k0 in range(0, k, tile_size):
-                    #for j in range(0, n, tile_size):
-                #set_trace()
-                k02 = i
-                j2 = j
-                a = D#[k02:k02+tile_size]
-                b = E[k02:k02+tile_size]#, j2:j2+tile_size]
-                #set_trace()
-                #F = F.at[i:i+tile_size, j2:j2+tile_size].add(jnp.matmul(a, b))
-                #F = F.at[i:i+tile_size, j2:j2+tile_size].add(jnp.matmul(a, b))
-                F = F.at[k02:k02+tile_size].add(jnp.matmul(a, b))
+            m, k = D.shape
+            k, n = E.shape
 
-        #assert jnp.allclose(F[i:i+tile_size], tiled_matmul(attn_weights.transpose(1,0), values_expanded)[i:i+tile_size])
+            #b = E[k02:k02+tile_size]#, j2:j2+tile_size]
+            #set_trace()
+            #F = F.at[i:i+tile_size, j2:j2+tile_size].add(jnp.matmul(a, b))
+            #F = F.at[i:i+tile_size, j2:j2+tile_size].add(jnp.matmul(a, b))
+            #F = F.at[k02:k02+tile_size].add(jnp.matmul(a, b))
 
-    #assert jnp.allclose(F, tiled_matmul(attn_weights.transpose(1,0), values_expanded))
+            #assert jnp.allclose(F[i:i+tile_size], tiled_matmul(attn_weights.transpose(1,0), values_expanded)[i:i+tile_size])
+            #assert jnp.allclose(F, tiled_matmul(attn_weights.transpose(1,0), values_expanded))
+
+            #set_trace()
+            #for k0 in range(0, n, tile_size):
+                #F = F.at[k0:k0+tile_size].add(jnp.matmul(a, b))
+            #k0 = j
+            a = D#[i:i+tile_size]#, k0:k0+tile_size]
+            b = E[j:j+tile_size]
+            print((i,j))
+            F = F.at[i:i+tile_size].add(jnp.matmul(a, b))
 
     context = F
     return context
+
 
 #partial(jax.jit, static_argnums=[2])
 def att2(queries, keys_expanded, chunk_size=1):
@@ -318,10 +337,11 @@ values_expanded = c
 
 r1 = att_head_o(queries, keys_expanded, values_expanded)
 r2 = att_head_g(queries, keys_expanded, values_expanded)
-r3 = att_head(queries, keys_expanded, values_expanded)
+r3 = att_head_g(queries, keys_expanded, values_expanded,simp=True)
+r4 = att_head(queries, keys_expanded, values_expanded)
 set_trace()
 assert jnp.allclose(r1, r2)
-assert jnp.allclose(r2, r3)
+assert jnp.allclose(r3, r4)
 
 #jax.clear_caches()
 run_nojit = 0
