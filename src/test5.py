@@ -179,14 +179,8 @@ def att_head_g(queries, keys_expanded, values_expanded, simp=False):
     assert jnp.allclose(C, tiled_matmul(queries, B))
     # 40960, 40960
 
-    if simp:
-        attn_scores = res / jnp.sqrt(head_dim)
-        #attn_scores = res
-        attn_weights = attn_scores
-    else:
-        # normalize by head dim
-        attn_scores = res / jnp.sqrt(head_dim)
-        attn_weights = jax.nn.softmax(attn_scores, axis=-1)
+    attn_scores = res / jnp.sqrt(head_dim)
+    attn_weights = jax.nn.softmax(attn_scores, axis=-1)
 
     # softmax
     #set_trace()
@@ -240,6 +234,7 @@ def att_head(queries, keys_expanded, values_expanded):
     #C = jnp.zeros((m, 128))
     # square in seq dims
     F = jnp.zeros((m, values_expanded.shape[-1]))
+    R = jnp.zeros((m, values_expanded.shape[-1]))
 
     # can actually skip tiling over the small 128 (head dimension)
     for i in range(0, m, tile_size):
@@ -290,9 +285,11 @@ def att_head(queries, keys_expanded, values_expanded):
             a = D#[i:i+tile_size]#, k0:k0+tile_size]
             b = E[j:j+tile_size]
             #print((i,j))
-            F = F.at[i:i+tile_size].add(jnp.matmul(a, b))
+            v = jnp.matmul(a,b)
+            F = F.at[i:i+tile_size].add(v)
 
-    context = F #/ jnp.sqrt(head_dim)
+    #context = F #/ jnp.sqrt(head_dim)
+    context = jax.nn.softmax(F, axis=-2)  #/ jnp.sqrt(head_dim)
     return context
 
 
@@ -339,7 +336,7 @@ r1 = att_head_o(queries, keys_expanded, values_expanded)
 r2 = att_head_g(queries, keys_expanded, values_expanded)
 r3 = att_head_g(queries, keys_expanded, values_expanded,simp=True)
 r4 = att_head(queries, keys_expanded, values_expanded)
-print(r3 -r4)
+print(r3 - r4)
 set_trace()
 assert jnp.allclose(r1, r2)
 assert jnp.allclose(r3, r4)
