@@ -214,7 +214,86 @@ def att_head_g(queries, keys_expanded, values_expanded, simp=False):
     context = F
     return context
 
-def att_head(queries, keys_expanded, values_expanded):
+import jax
+import jax.numpy as jnp
+
+def att_head_vibe1(queries, keys, values, tile_size=1024):
+    # qwen3-coder 
+    m, d_k = queries.shape
+    n, _ = keys.shape
+    head_dim = d_k
+
+    # Initialize accumulators
+    F = jnp.zeros((m, values.shape[-1]))  # weighted sum (numerator)
+    L = jnp.zeros((m, 1))                 # normalizer (denominator)
+    M = jnp.full((m, 1), -jnp.inf)        # max per row
+
+    for j in range(0, n, tile_size):
+        k_chunk = keys[j:j+tile_size]       # (tile_size, d_k)
+        v_chunk = values[j:j+tile_size]     # (tile_size, d_v)
+
+        # Compute logits for this tile: (m, tile_size)
+        logits = jnp.matmul(queries, k_chunk.transpose(1, 0)) / jnp.sqrt(head_dim)
+
+        # Track max for numerical stability
+        max_logits = jnp.max(logits, axis=-1, keepdims=True)  # (m, 1)
+        new_max = jnp.maximum(M, max_logits)
+
+        # Compute exp of shifted logits
+        exp_logits = jnp.exp(logits - new_max)  # (m, tile_size)
+
+        # Update normalizer (sum of exp logits)
+        L = L * jnp.exp(M - new_max) + jnp.sum(exp_logits, axis=-1, keepdims=True)
+
+        # Update weighted values
+        F = F * jnp.exp(M - new_max) + jnp.matmul(exp_logits, v_chunk)
+
+        # Update max
+        M = new_max
+
+    # Normalize to get final context
+    context = F / L
+    return context
+
+def att_head(queries, keys, values, tile_size=1024):
+    m, d_k = queries.shape
+    n, _ = keys.shape
+    head_dim = d_k
+
+    # Initialize accumulators
+    F = jnp.zeros((m, values.shape[-1]))   # weighted sum
+    L = jnp.zeros((m, 1))                  # normalizer (sum of exp logits)
+    M = jnp.full((m, 1), -jnp.inf)         # running max
+
+    # Loop over key/value tiles
+    for j in range(0, n, tile_size):
+        k_chunk = keys[j:j+tile_size]      # (tile_sz, d_k)
+        v_chunk = values[j:j+tile_size]    # (tile_sz, d_v)
+
+        # Compute attention logits for this tile: (m, tile_sz)
+        logits = jnp.matmul(queries, k_chunk.T) / jnp.sqrt(head_dim)
+
+        # Numerically stable online softmax
+        max_logits = jnp.max(logits, axis=-1, keepdims=True)  # (m, 1)
+        new_max = jnp.maximum(M, max_logits)
+
+        # Compute exp of shifted logits
+        exp_logits = jnp.exp(logits - new_max)
+
+        # Update normalizer and weighted sum
+        old_shift = jnp.exp(M - new_max)
+        L = L * old_shift + jnp.sum(exp_logits, axis=-1, keepdims=True)
+        F = F * old_shift + jnp.matmul(exp_logits, v_chunk)
+
+        # Update max
+        M = new_max
+
+    # Final normalization
+    context = F / L
+    return context
+
+
+def att_head_i(queries, keys_expanded, values_expanded):
     tile_size = 1024
     # matmul1
     A = queries
