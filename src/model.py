@@ -10,6 +10,7 @@ from collections import defaultdict
 import numpy as np 
 from tqdm import tqdm
 from pdb import set_trace
+from timeit import timeit
 
 from functools import partial, reduce
 
@@ -24,8 +25,8 @@ def feedforward_forward(params, x):
     up = jnp.einsum('bse,eh->bsh', x, params["up_proj"])
     return jnp.einsum('bsh,he->bse', gate * up, params["down_proj"])
 
-dtype = jax.dtypes.bfloat16
-#dtype = jnp.float16
+#dtype = jax.dtypes.bfloat16
+dtype = jnp.float16
 #dtype = jnp.float32
 cl = 40960
 #cl = 1024
@@ -76,6 +77,7 @@ def apply_qk_norm(x, norm_params):
     return x_normed.reshape(b, h, s, d)
 
 
+'''
 def manual_vmap(fn, *args):
     dim1 = args[0].shape[0]
     outputs = []
@@ -85,8 +87,18 @@ def manual_vmap(fn, *args):
         outputs.append(out)
 
     return jnp.stack(outputs)
+'''
 
-def att_head(queries, keys, values, pre, position_offset, tile_size=1024):
+def manual_vmap(att_head, queries, keys_expanded, values_expanded, pre, position_offset):
+    def bodyfn(carry, x):
+        queries, keys_expanded, values_expanded = x
+        x = att_head(queries, keys_expanded, values_expanded, pre, position_offset)
+        return carry, x
+    carry, xr = jax.lax.scan(bodyfn, None, xs=(queries, keys_expanded, values_expanded))
+    return xr
+
+
+def att_head3(queries, keys, values, pre, position_offset, tile_size=1024):
     m, d_k = queries.shape
     n, _ = keys.shape
     head_dim = d_k
@@ -123,6 +135,48 @@ def att_head(queries, keys, values, pre, position_offset, tile_size=1024):
     context = F / L
     return context
 
+def att_head(queries, keys, values, pre, position_offset, tile_size=32):
+    m, d_k = queries.shape
+    n, _ = keys.shape
+    head_dim = d_k
+
+    # Initialize accumulators
+    Fi = jnp.zeros((m, values.shape[-1]))   # weighted sum
+    Li = jnp.zeros((m, 1))                  # normalizer (sum of exp logits)
+    Mi = jnp.full((m, 1), -jnp.inf)         # running max
+
+    init = ( Fi, Li, Mi )
+    ks = jnp.reshape(keys, (m//tile_size, tile_size, d_k))
+    vs = jnp.reshape(values, (m//tile_size, tile_size, d_k))
+    xs = (ks,vs)
+
+    def bodyfn(carry, x):
+        k_chunk, v_chunk = x
+        F, L, M = carry
+
+        # Compute attention logits for this tile: (m, tile_sz)
+        logits = jnp.matmul(queries, k_chunk.T) / jnp.sqrt(head_dim)
+
+        # Numerically stable online softmax
+        max_logits = jnp.max(logits, axis=-1, keepdims=True)  # (m, 1)
+        new_max = jnp.maximum(M, max_logits)
+
+        # Compute exp of shifted logits
+        exp_logits = jnp.exp(logits - new_max)
+
+        # Update normalizer and weighted sum
+        old_shift = jnp.exp(M - new_max)
+        L = L * old_shift + jnp.sum(exp_logits, axis=-1, keepdims=True)
+        F = F * old_shift + jnp.matmul(exp_logits, v_chunk)
+
+        # Update max
+        M = new_max
+        return (F,L,M), _
+
+    (F,L,_), _ = jax.lax.scan(bodyfn, init, xs)
+    context = F / L
+    return context
+
 
 
 def att_head_orig(queries, keys_expanded, values_expanded, pre, position_offset):
@@ -152,7 +206,8 @@ def att2(queries, keys_expanded, values_expanded, out_proj, pre, position_offset
     #context = jax.vmap(att_head, in_axes=(0,0,0))(queries, keys_expanded, values_expanded)
     #context = chunked_vmap(att_head, queries, keys_expanded, values_expanded, chunk_size=chunk_size)
     
-    context = manual_vmap(att_head, queries, keys_expanded, values_expanded, [pre]*queries.shape[0], [position_offset]*queries.shape[0])
+    #context = manual_vmap(att_head, queries, keys_expanded, values_expanded, [pre]*queries.shape[0], [position_offset]*queries.shape[0])
+    context = manual_vmap(att_head, queries, keys_expanded, values_expanded, pre, position_offset)
 
     context = context.transpose(1,0,2).reshape(queries.shape[1], cfg['n_heads'] * cfg['head_dim'])
     output = jnp.einsum('sh,hd->sd', context, out_proj)
@@ -277,6 +332,7 @@ def get_logits(cfg, x, params, vocab_chunk_size=128):
     return logits
 
 
+#@partial(jax.jit, static_argnums=[5])
 def qwen3_forward_kv(params, x, cfg, kv_cache, position_offset, pre=False):
     x = params["tok_emb"][x]
 
@@ -366,7 +422,26 @@ def generate_kv_optimized(model, idx, max_new_tokens, context_size, temperature=
     position_offset = 0
     
     # prefill1
-    logits, kv_cache, position_offset = qwen3_forward_kv(params, cur_ids, cfg, kv_cache, position_offset, pre=True)
+    if 0:
+        logits, kv_cache, position_offset = qwen3_forward_kv(params, cur_ids, cfg, kv_cache, position_offset, pre=True)
+        block([logits, kv_cache, position_offset])
+
+    logits2, kv_cache2, position_offset2 = qwen3_forward_kv(params, cur_ids, cfg, kv_cache, position_offset, pre=True)
+    block([logits2, kv_cache2, position_offset2])
+
+    from time import perf_counter
+
+    for i in range(3):
+        stt = perf_counter()
+        #logits, kv_cache, position_offset = qwen3_forward_kv(params, cur_ids, cfg, kv_cache, position_offset, pre=True)
+        logits2, kv_cache2, position_offset2 = qwen3_forward_kv(params, cur_ids, cfg, kv_cache, position_offset, pre=True)
+        block([logits2, kv_cache2, position_offset2])
+        ft = perf_counter()
+        print(ft-stt)
+
+    set_trace()
+
+    exit(0)
 
     # get generation function
     f = steptop(params, cfg)
@@ -382,8 +457,9 @@ def generate_kv_optimized(model, idx, max_new_tokens, context_size, temperature=
     lowered = traced.lower()
     compiled_gen = lowered.compile()
     import gc
+    exit()
 
-    use_lax = True
+    use_lax = False
     if use_lax:
         # warmup
         cur_ids3 = jnp.array([[1999]*26])

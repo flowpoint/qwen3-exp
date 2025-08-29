@@ -61,6 +61,7 @@ def tiled_attention(queries, keys, values, tile_size=1024):
     vs = jnp.reshape(values, (m//tile_size, tile_size, d_k))
     xs = (ks,vs)
 
+    # note, bodyfn isnt pure on inputs, it uses queries
     def bodyfn(carry, x):
         set_trace()
         k_chunk, v_chunk = x
