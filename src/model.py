@@ -25,8 +25,8 @@ def feedforward_forward(params, x):
     up = jnp.einsum('bse,eh->bsh', x, params["up_proj"])
     return jnp.einsum('bsh,he->bse', gate * up, params["down_proj"])
 
-#dtype = jax.dtypes.bfloat16
-dtype = jnp.float16
+dtype = jax.dtypes.bfloat16
+#dtype = jnp.float16
 #dtype = jnp.float32
 cl = 40960
 #cl = 1024
@@ -135,7 +135,7 @@ def att_head3(queries, keys, values, pre, position_offset, tile_size=1024):
     context = F / L
     return context
 
-def att_head(queries, keys, values, pre, position_offset, tile_size=32):
+def att_head_scan_nocausal(queries, keys, values, pre, position_offset, tile_size=32):
     m, d_k = queries.shape
     n, _ = keys.shape
     head_dim = d_k
@@ -178,12 +178,73 @@ def att_head(queries, keys, values, pre, position_offset, tile_size=32):
     return context
 
 
+def att_head(queries, keys, values, pre=True, position_offset=0, tile_size=1024):
+    """
+    Tiled attention with causal masking for both prefill (triangular) and generation (prefix).
+    Numerically stable online softmax accumulation across tiles.
+
+    queries: (m, d_k)
+    keys:    (n, d_k)
+    values:  (n, d_v)
+    """
+    m, d_k = queries.shape
+    n, d_k2 = keys.shape
+    assert d_k == d_k2, "queries and keys must have the same head dimension"
+    d_v = values.shape[-1]
+    head_dim = d_k
+
+    F = jnp.zeros((m, d_v), dtype=queries.dtype)     # weighted sum accumulator
+    L = jnp.zeros((m, 1), dtype=queries.dtype)       # normalizer accumulator
+    M = jnp.full((m, 1), -jnp.inf, dtype=queries.dtype)  # running max accumulator
+
+    # Iterate over tiles of keys/values
+    for k_start in range(0, n, tile_size):
+        k_end = min(k_start + tile_size, n)
+        k_chunk = keys[k_start:k_end]     # (tile_len, d_k)
+        v_chunk = values[k_start:k_end]   # (tile_len, d_v)
+        tile_len = k_end - k_start
+
+        # logits: (m, tile_len)
+        logits = (queries @ k_chunk.T) / jnp.sqrt(head_dim)
+
+        # Build causal mask for this tile
+        if pre:
+            # prefill: mask keys j > i for each query index i (triangular)
+            q_idx = jnp.arange(m)[:, None]                           # (m, 1)
+            k_idx = (k_start + jnp.arange(tile_len))[None, :]        # (1, tile_len)
+            mask = k_idx > q_idx                                     # (m, tile_len) boolean
+        else:
+            # generation: mask keys j > position_offset + 1, independent of i
+            thresh = position_offset + 1
+            k_idx = (k_start + jnp.arange(tile_len))[None, :]        # (1, tile_len)
+            mask = k_idx > thresh
+            mask = jnp.broadcast_to(mask, logits.shape)              # (m, tile_len)
+
+        masked_logits = jnp.where(mask, -jnp.inf, logits)
+
+        # Online softmax merge with numerical stability and masking safety
+        max_logits_tile = jnp.max(masked_logits, axis=-1, keepdims=True)  # -inf if all masked
+        new_M = jnp.maximum(M, max_logits_tile)
+
+        # When new_M == -inf for a row, set alpha/beta to 0 to avoid NaNs
+        is_finite_new = jnp.isfinite(new_M)
+        alpha = jnp.where(is_finite_new, jnp.exp(M - new_M), 0.0)
+        beta = jnp.where(jnp.isfinite(masked_logits), jnp.exp(masked_logits - new_M), 0.0)
+
+        L = L * alpha + jnp.sum(beta, axis=-1, keepdims=True)        # (m,1)
+        F = F * alpha + beta @ v_chunk                               # (m,d_v)
+        M = new_M
+
+    # Final context
+    context = F / L
+    return context
+
+
 
 def att_head_orig(queries, keys_expanded, values_expanded, pre, position_offset):
     #attn_scores = jnp.einsum('qh,kh->qk', queries, keys_expanded) / jnp.sqrt(head_dim)
     attn_scores = jnp.matmul(queries, keys_expanded.transpose(1,0)) / jnp.sqrt(cfg['head_dim'])
 
-    '''
     if pre:
         q_len, k_len = queries.shape[0], keys_expanded.shape[0]
         causal_mask = jnp.triu(jnp.ones((q_len, k_len)), k=1)
@@ -192,7 +253,6 @@ def att_head_orig(queries, keys_expanded, values_expanded, pre, position_offset)
     else:
         mask = np.arange(keys_expanded.shape[0]) > position_offset + 1
         attn_scores = jnp.where(mask, -jnp.float_('inf'), attn_scores)
-    '''
 
     #return attn_scores
     attn_weights = jax.nn.softmax(attn_scores, axis=-1)
@@ -422,10 +482,11 @@ def generate_kv_optimized(model, idx, max_new_tokens, context_size, temperature=
     position_offset = 0
     
     # prefill1
-    if 0:
-        logits, kv_cache, position_offset = qwen3_forward_kv(params, cur_ids, cfg, kv_cache, position_offset, pre=True)
-        block([logits, kv_cache, position_offset])
+    #if 0:
+    logits, kv_cache, position_offset = qwen3_forward_kv(params, cur_ids, cfg, kv_cache, position_offset, pre=True)
+    block([logits, kv_cache, position_offset])
 
+    '''
     logits2, kv_cache2, position_offset2 = qwen3_forward_kv(params, cur_ids, cfg, kv_cache, position_offset, pre=True)
     block([logits2, kv_cache2, position_offset2])
 
@@ -440,8 +501,8 @@ def generate_kv_optimized(model, idx, max_new_tokens, context_size, temperature=
         print(ft-stt)
 
     set_trace()
+    '''
 
-    exit(0)
 
     # get generation function
     f = steptop(params, cfg)
@@ -457,9 +518,8 @@ def generate_kv_optimized(model, idx, max_new_tokens, context_size, temperature=
     lowered = traced.lower()
     compiled_gen = lowered.compile()
     import gc
-    exit()
 
-    use_lax = False
+    use_lax = True
     if use_lax:
         # warmup
         cur_ids3 = jnp.array([[1999]*26])
