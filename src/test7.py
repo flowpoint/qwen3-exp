@@ -129,26 +129,32 @@ import jax.random as random
 
 # Config
 cfg = {"head_dim": 128}
-tile_size = 64
+tile_size = 1024
 
 # Random inputs
 key = random.PRNGKey(42)
-m, n = 128, 256  # query_len, key/value_len
+m, n = 8192, 8192  # query_len, key/value_len
 d_k = cfg["head_dim"]
 
-queries = random.normal(key, (m, d_k))
-keys = random.normal(key, (n, d_k))
-values = random.normal(key, (n, d_k))
+#dtype = jax.dtypes.bfloat16
+#dtype = jnp.float16
+#dtype = jnp.float32
+dtype = jnp.float64
+
+queries = random.normal(key, (m, d_k),dtype=dtype)
+keys = random.normal(key, (n, d_k),dtype=dtype)
+values = random.normal(key, (n, d_k),dtype=dtype)
 
 # Run original attention
 context_orig = att_head_orig(queries, keys, values, pre=True, position_offset=0)
 
 # Run tiled attention
-context_tiled = tiled_attention_cleaner(queries, keys, values, tile_size=tile_size, pre=True)
+context_tiled = tiled_attention_cleaner(queries, keys, values, tile_size=tile_size, pre=True, position_offset=0)
 
 # Compare
 diff = jnp.abs(context_orig - context_tiled).max()
 print(f"Max absolute difference: {diff}")
+print(jnp.allclose(context_orig,context_tiled))
 
 position_offset = 64
 context_orig_gen = att_head_orig(queries, keys, values, pre=False, position_offset=position_offset)
@@ -157,3 +163,4 @@ context_tiled_gen = tiled_attention_cleaner(queries, keys, values, tile_size=til
 diff = jnp.abs(context_orig_gen - context_tiled_gen).max()
 
 print(f"Max absolute difference: {diff}")
+print(jnp.allclose(context_orig_gen,context_tiled_gen))

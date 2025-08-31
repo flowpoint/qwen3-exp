@@ -38,28 +38,40 @@ def tiled_attention_causal(queries, keys, values, pre=True, position_offset=0, t
     L = jnp.zeros((m, 1), dtype=queries.dtype)       # normalizer accumulator
     M = jnp.full((m, 1), -jnp.inf, dtype=queries.dtype)  # running max accumulator
 
-    # Iterate over tiles of keys/values
+    # Initialize accumulators
+    Fi = jnp.zeros((m, values.shape[-1]))   # weighted sum
+    Li = jnp.zeros((m, 1))                  # normalizer (sum of exp logits)
+    Mi = jnp.full((m, 1), -jnp.inf)         # running max
+
+    init = ( Fi, Li, Mi )
+    ks = jnp.reshape(keys, (m//tile_size, tile_size, d_k))
+    vs = jnp.reshape(values, (m//tile_size, tile_size, d_k))
+
+    masks = []
     for k_start in range(0, n, tile_size):
-        k_end = min(k_start + tile_size, n)
-        k_chunk = keys[k_start:k_end]     # (tile_len, d_k)
-        v_chunk = values[k_start:k_end]   # (tile_len, d_v)
-        tile_len = k_end - k_start
-
-        # logits: (m, tile_len)
-        logits = (queries @ k_chunk.T) / jnp.sqrt(head_dim)
-
-        # Build causal mask for this tile
         if pre:
             # prefill: mask keys j > i for each query index i (triangular)
             q_idx = jnp.arange(m)[:, None]                           # (m, 1)
-            k_idx = (k_start + jnp.arange(tile_len))[None, :]        # (1, tile_len)
+            k_idx = (k_start + jnp.arange(tile_size))[None, :]        # (1, tile_len)
             mask = k_idx > q_idx                                     # (m, tile_len) boolean
+            masks.append(mask)
         else:
             # generation: mask keys j > position_offset + 1, independent of i
             thresh = position_offset + 1
-            k_idx = (k_start + jnp.arange(tile_len))[None, :]        # (1, tile_len)
+            k_idx = (k_start + jnp.arange(tile_size))[None, :]        # (1, tile_len)
             mask = k_idx > thresh
-            mask = jnp.broadcast_to(mask, logits.shape)              # (m, tile_len)
+            mask = jnp.broadcast_to(mask, [tile_size, tile_size]) #logits.shape)              # (m, tile_len)
+            masks.append(mask)
+
+    xs = (ks,vs, masks)
+
+    # Iterate over tiles of keys/values
+    def bodyfn(carry, x):
+        k_chunk, v_chunk, mask = x
+        F, L, M = carry
+
+        # logits: (m, tile_len)
+        logits = (queries @ k_chunk.T) / jnp.sqrt(head_dim)
 
         masked_logits = jnp.where(mask, -jnp.inf, logits)
 
@@ -75,8 +87,10 @@ def tiled_attention_causal(queries, keys, values, pre=True, position_offset=0, t
         L = L * alpha + jnp.sum(beta, axis=-1, keepdims=True)        # (m,1)
         F = F * alpha + beta @ v_chunk                               # (m,d_v)
         M = new_M
+        return (F,L,M), _
 
     # Final context
+    (F,L,_), _ = jax.lax.scan(bodyfn, init, xs)
     context = F / L
     return context
 

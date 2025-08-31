@@ -11,6 +11,7 @@ import numpy as np
 from tqdm import tqdm
 from pdb import set_trace
 from timeit import timeit
+import time
 
 from functools import partial, reduce
 
@@ -25,9 +26,9 @@ def feedforward_forward(params, x):
     up = jnp.einsum('bse,eh->bsh', x, params["up_proj"])
     return jnp.einsum('bsh,he->bse', gate * up, params["down_proj"])
 
-dtype = jax.dtypes.bfloat16
+#dtype = jax.dtypes.bfloat16
 #dtype = jnp.float16
-#dtype = jnp.float32
+dtype = jnp.float32
 cl = 40960
 #cl = 1024
 #cl = 27
@@ -177,8 +178,63 @@ def att_head_scan_nocausal(queries, keys, values, pre, position_offset, tile_siz
     context = F / L
     return context
 
+#@partial(jax.jit, static_argnums=[3])
+def att_head_coder_causal(queries, keys, values, pre, position_offset, tile_size=1024):
+    dtype_l = jnp.float64
+    queries = queries.astype(dtype_l)
+    keys = keys.astype(dtype_l)
+    values = values.astype(dtype_l)
 
-def att_head(queries, keys, values, pre=True, position_offset=0, tile_size=1024):
+    m, d_k = queries.shape
+    n, _ = keys.shape
+    head_dim = d_k
+
+    Fi = jnp.zeros((m, values.shape[-1]), dtype=dtype_l)
+    Li = jnp.zeros((m, 1), dtype=dtype_l)
+    Mi = jnp.full((m, 1), -jnp.inf, dtype=dtype_l)
+    init = (Fi, Li, Mi)
+
+    num_full_tiles = n // tile_size
+    ks = jnp.reshape(keys[:num_full_tiles * tile_size], (num_full_tiles, tile_size, d_k))
+    vs = jnp.reshape(values[:num_full_tiles * tile_size], (num_full_tiles, tile_size, d_k))
+
+    def bodyfn(carry, scan_input):
+        k_chunk, v_chunk, start_idx = scan_input
+        F, L, M = carry
+
+        logits = jnp.matmul(queries, k_chunk.T) / jnp.sqrt(head_dim)  # (m, tile_sz)
+
+        # Causal masking
+        q_positions = jnp.arange(m)[:, None]  # (m, 1)
+        k_positions = jnp.arange(tile_size)[None, :] + start_idx  # (1, tile_sz)
+
+        if pre:
+            causal_mask = k_positions > q_positions  # (m, tile_sz)
+        else:
+            causal_mask = k_positions > (position_offset + 1)  # (m, tile_sz)
+
+        logits = jnp.where(causal_mask, -jnp.inf, logits)
+
+        # Softmax
+        max_logits = jnp.max(logits, axis=-1, keepdims=True)
+        new_max = jnp.maximum(M, max_logits)
+        exp_logits = jnp.exp(logits - new_max)
+        old_shift = jnp.exp(M - new_max)
+        L = L * old_shift + jnp.sum(exp_logits, axis=-1, keepdims=True)
+        F = F * old_shift + jnp.matmul(exp_logits, v_chunk)
+        M = new_max
+
+        return (F, L, M), None
+
+    # Pass start indices with chunks
+    start_indices = jnp.arange(0, num_full_tiles * tile_size, tile_size)
+    scan_inputs = (ks, vs, start_indices)
+
+    (F, L, _), _ = jax.lax.scan(bodyfn, init, scan_inputs)
+    return (F / L).astype(dtype)
+
+
+def att_head_gpt5(queries, keys, values, pre=True, position_offset=0, tile_size=1024):
     """
     Tiled attention with causal masking for both prefill (triangular) and generation (prefix).
     Numerically stable online softmax accumulation across tiles.
@@ -267,13 +323,13 @@ def att2(queries, keys_expanded, values_expanded, out_proj, pre, position_offset
     #context = chunked_vmap(att_head, queries, keys_expanded, values_expanded, chunk_size=chunk_size)
     
     #context = manual_vmap(att_head, queries, keys_expanded, values_expanded, [pre]*queries.shape[0], [position_offset]*queries.shape[0])
-    context = manual_vmap(att_head, queries, keys_expanded, values_expanded, pre, position_offset)
+
+    #context = manual_vmap(att_head_coder_causal, queries, keys_expanded, values_expanded, pre, position_offset)
+    context = manual_vmap(att_head_orig, queries, keys_expanded, values_expanded, pre, position_offset)
 
     context = context.transpose(1,0,2).reshape(queries.shape[1], cfg['n_heads'] * cfg['head_dim'])
     output = jnp.einsum('sh,hd->sd', context, out_proj)
     return output
-
-
     
 
 #@partial(jax.jit, static_argnums=[0,1,2,7,])
@@ -302,8 +358,11 @@ def grouped_query_attention_forward_kv(num_heads, num_kv_groups, head_dim, param
     keys = apply_rope_with_offset(keys, cos, sin, position_offset)
     
     if pre:
-        keys = jnp.concatenate([kv_cache["keys"][:,:, :position_offset], keys], axis=2)
-        values = jnp.concatenate([kv_cache["values"][:,:,:position_offset], values], axis=2)
+        position_offset=0
+        #set_trace()
+        keyp = kv_cache['keys'][:,:,:position_offset]
+        keys = jnp.concatenate([keyp, keys], axis=2)
+        values = jnp.concatenate([keyp,values], axis=2)
         
         kv_cache["keys"] = kv_cache["keys"].at[:,:,:keys.shape[2]].set(keys)
         kv_cache["values"] = kv_cache["values"].at[:,:,:values.shape[2]].set(values)
@@ -392,11 +451,12 @@ def get_logits(cfg, x, params, vocab_chunk_size=128):
     return logits
 
 
-#@partial(jax.jit, static_argnums=[5])
+@partial(jax.jit, static_argnums=[5], donate_argnums=[3])
 def qwen3_forward_kv(params, x, cfg, kv_cache, position_offset, pre=False):
     x = params["tok_emb"][x]
 
     new_cache = {"keys": [], "values":[]}
+    #set_trace()
     for i, block_params in enumerate(params["trf_blocks"]):
         layer_cache = {"keys": kv_cache["keys"][:,i], "values": kv_cache["values"][:,i]}
         x, updated_cache, position_offset_new = transformer_block_forward_kv(block_params, layer_cache, position_offset, x, pre=pre)
@@ -433,10 +493,26 @@ def steptop(params, cfg):
 
 
 #scan(step, init=[params, cfg, kv_cache])(next_token, position_offset)
-import time
+def decode_step(carry,x):#logits, kv_cache, position_offset, cur_ids):
+    params, logits, kv_cache, position_offset = carry
+
+    next_token_logits = logits[:, -1, :]
+    next_token = jnp.argmax(next_token_logits, axis=-1)
+    
+    # Process next tokens for entire batch
+    logits, kv_cache, position_offset = qwen3_forward_kv(params, next_token[:, None], cfg, kv_cache, position_offset)
+    return [params, logits, kv_cache, position_offset ], next_token
 
 #@jax.jit
-def gen(f, logits, kv_cache, position_offset,  max_new_tokens):
+def gen(params, logits, kv_cache, position_offset,  max_new_tokens):
+    [params, logits, kv_cache, position_offset], seq = jax.lax.scan(
+            decode_step, 
+            init=[params, logits, kv_cache, position_offset], length=max_new_tokens,
+            unroll=False, #20,
+            )
+    return [logits, kv_cache, position_offset], seq
+
+def gen2(f, logits, kv_cache, position_offset,  max_new_tokens):
     [logits, kv_cache, position_offset], seq = jax.lax.scan(
             f, 
             init=[logits, kv_cache, position_offset], length=max_new_tokens,
@@ -505,26 +581,36 @@ def generate_kv_optimized(model, idx, max_new_tokens, context_size, temperature=
 
 
     # get generation function
+    '''
     f = steptop(params, cfg)
     # prefill2
     [logits, kv_cache, position_offset], _ = f([logits, kv_cache, position_offset], None)
     block([logits, kv_cache, position_offset])
     jax.clear_caches()
+    '''
+    f = steptop(params, cfg)
+    # prefill2
+    [logits, kv_cache, position_offset], _ = f([logits, kv_cache, position_offset], None)
+    block([logits, kv_cache, position_offset])
+    jax.clear_caches()
+    '''
 
     cur_ids2 = jnp.array([[999]*26])
 
     #logits, kv_cache, position_offset, cur_ids = gen(f, logits, kv_cache, position_offset, cur_ids2, max_new_tokens)
-    traced = jax.jit(gen, static_argnums=[0,3,4]).trace(f, logits, kv_cache, position_offset, max_new_tokens)
+    set_trace()
+    traced = jax.jit(gen, static_argnums=[3,4]).trace(params, logits, kv_cache, int(position_offset), max_new_tokens)
     lowered = traced.lower()
     compiled_gen = lowered.compile()
     import gc
+    '''
 
-    use_lax = True
+    use_lax = False
     if use_lax:
         # warmup
         cur_ids3 = jnp.array([[1999]*26])
-        [logits1, kv_cache1, position_offset1], seq2 = compiled_gen(logits, kv_cache)
-        block([logits1, kv_cache1, position_offset1, seq2])
+        [params1,logits1, kv_cache1, position_offset1], seq2 = compiled_gen(params, logits, kv_cache)
+        block([params1, logits1, kv_cache1, position_offset1, seq2])
         del logits1, kv_cache1, position_offset1, 
         gc.collect()
 
@@ -558,10 +644,15 @@ def generate_kv_optimized(model, idx, max_new_tokens, context_size, temperature=
         if profile:
             jax.profiler.stop_trace()
     else:
+        set_trace()
+        seq = []
         for i in tqdm(range(max_new_tokens), desc="Generating"):
-            [logits, kv_cache, position_offset, ], seq = f([logits, kv_cache, position_offset, ], None)
+            #[logits, kv_cache, position_offset, ], seq = f([logits, kv_cache, position_offset, ], None)
+            [params, logits, kv_cache, position_offset], nt = decode_step([params, logits, kv_cache, position_offset], None )
+            seq.append(nt)
             if eos_id is not None and cur_ids[-1] == eos_id:
                 break
+        seq = jnp.stack(seq)
 
     
     '''
