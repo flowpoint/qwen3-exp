@@ -110,6 +110,62 @@ def tiled_attention_cleaner(queries, keys, values, tile_size=1024, pre=True, pos
     (F, L, _), _ = jax.lax.scan(bodyfn, init, scan_inputs)
     return F / L
 
+def att_head_coder_causal(queries, keys, values, pre, position_offset, tile_size=1024):
+    #set_trace()
+    dtype_l = jnp.float64
+    queries = queries.astype(dtype_l)
+    keys = keys.astype(dtype_l)
+    values = values.astype(dtype_l)
+
+    m, d_k = queries.shape
+    n, _ = keys.shape
+    head_dim = d_k
+
+    Fi = jnp.zeros((m, values.shape[-1]), dtype=dtype_l)
+    Li = jnp.zeros((m, 1), dtype=dtype_l)
+    Mi = jnp.full((m, 1), -jnp.inf, dtype=dtype_l)
+    init = (Fi, Li, Mi)
+
+    num_full_tiles = n // tile_size
+    ks = jnp.reshape(keys[:num_full_tiles * tile_size], (num_full_tiles, tile_size, d_k))
+    vs = jnp.reshape(values[:num_full_tiles * tile_size], (num_full_tiles, tile_size, d_k))
+
+    def bodyfn(carry, scan_input):
+        k_chunk, v_chunk, start_idx = scan_input
+        F, L, M = carry
+
+        logits = jnp.matmul(queries, k_chunk.T) / jnp.sqrt(head_dim)  # (m, tile_sz)
+
+        # Causal masking
+        q_positions = jnp.arange(m)[:, None]  # (m, 1)
+        k_positions = jnp.arange(tile_size)[None, :] + start_idx  # (1, tile_sz)
+
+        if pre:
+            causal_mask = k_positions > q_positions  # (m, tile_sz)
+        else:
+            causal_mask = k_positions > (position_offset + 1)  # (m, tile_sz)
+
+        logits = jnp.where(causal_mask, -jnp.inf, logits)
+
+        # Softmax
+        max_logits = jnp.max(logits, axis=-1, keepdims=True)
+        new_max = jnp.maximum(M, max_logits)
+        exp_logits = jnp.exp(logits - new_max)
+        old_shift = jnp.exp(M - new_max)
+        L = L * old_shift + jnp.sum(exp_logits, axis=-1, keepdims=True)
+        F = F * old_shift + jnp.matmul(exp_logits, v_chunk)
+        M = new_max
+
+        return (F, L, M), None
+
+    # Pass start indices with chunks
+    start_indices = jnp.arange(0, num_full_tiles * tile_size, tile_size)
+    scan_inputs = (ks, vs, start_indices)
+
+    (F, L, _), _ = jax.lax.scan(bodyfn, init, scan_inputs)
+    #return (F / L).astype(dtype)
+    return jnp.where(L != 0, F / L, 0.0)
+
 def att_head_orig(queries, keys_expanded, values_expanded, pre, position_offset):
     attn_scores = jnp.matmul(queries, keys_expanded.transpose(1,0)) / jnp.sqrt(128)
 
@@ -131,36 +187,46 @@ import jax.random as random
 cfg = {"head_dim": 128}
 tile_size = 1024
 
-# Random inputs
-key = random.PRNGKey(42)
-m, n = 8192, 8192  # query_len, key/value_len
-d_k = cfg["head_dim"]
+for i  in range(10):
+    # Random inputs
+    key = random.PRNGKey(i)
+    #m, n = 8192, 8192  # query_len, key/value_len
+    m, n = 8192, 8192  # query_len, key/value_len
+    d_k = cfg["head_dim"]
 
-#dtype = jax.dtypes.bfloat16
-#dtype = jnp.float16
-#dtype = jnp.float32
-dtype = jnp.float64
+    #dtype = jax.dtypes.bfloat16
+    #dtype = jnp.float16
+    dtype = jnp.float32
+    #dtype = jnp.float64
 
-queries = random.normal(key, (m, d_k),dtype=dtype)
-keys = random.normal(key, (n, d_k),dtype=dtype)
-values = random.normal(key, (n, d_k),dtype=dtype)
+    queries = random.uniform(key, (m, d_k),dtype=dtype)
+    keys = random.uniform(key, (n, d_k),dtype=dtype)
+    values = random.uniform(key, (n, d_k),dtype=dtype)
 
-# Run original attention
-context_orig = att_head_orig(queries, keys, values, pre=True, position_offset=0)
+    # queries = jnp.zeros((m, d_k),dtype=dtype)
+    # keys = jnp.zeros((n, d_k),dtype=dtype)
+    # values = jnp.zeros((n, d_k),dtype=dtype)
 
-# Run tiled attention
-context_tiled = tiled_attention_cleaner(queries, keys, values, tile_size=tile_size, pre=True, position_offset=0)
+    for position_offset in range(10):
+        # Run original attention
+        context_orig = att_head_orig(queries, keys, values, pre=True, position_offset=0)
 
-# Compare
-diff = jnp.abs(context_orig - context_tiled).max()
-print(f"Max absolute difference: {diff}")
-print(jnp.allclose(context_orig,context_tiled))
+        # Run tiled attention
+        #context_tiled = tiled_attention_cleaner(queries, keys, values, tile_size=tile_size, pre=True, position_offset=0)
+        context_tiled = att_head_coder_causal(queries, keys, values, pre=True, position_offset=0)# tile_size=tile_size, pre=True, position_offset=0)
 
-position_offset = 64
-context_orig_gen = att_head_orig(queries, keys, values, pre=False, position_offset=position_offset)
-context_tiled_gen = tiled_attention_cleaner(queries, keys, values, tile_size=tile_size, pre=False, position_offset=position_offset)
+        # Compare
+        diff = jnp.abs(context_orig - context_tiled).max()
+        print(f"Max absolute difference: {diff}")
+        print(jnp.allclose(context_orig,context_tiled))
 
-diff = jnp.abs(context_orig_gen - context_tiled_gen).max()
+    #position_offset = 64
+    for position_offset in range(10):
+        context_orig_gen = att_head_orig(queries, keys, values, pre=False, position_offset=position_offset)
+        #context_tiled_gen = tiled_attention_cleaner(queries, keys, values, tile_size=tile_size, pre=False, position_offset=position_offset)
+        context_tiled_gen = att_head_coder_causal(queries, keys, values, pre=False, position_offset=position_offset)# tile_size=tile_size, pre=True, position_offset=0)
 
-print(f"Max absolute difference: {diff}")
-print(jnp.allclose(context_orig_gen,context_tiled_gen))
+        diff = jnp.abs(context_orig_gen - context_tiled_gen).max()
+
+        print(f"Max absolute difference: {diff}")
+        print(jnp.allclose(context_orig_gen,context_tiled_gen))

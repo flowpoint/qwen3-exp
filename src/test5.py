@@ -264,6 +264,7 @@ def att_head_vibe1(queries, keys, values, tile_size=1024):
     return context
 
 def att_head(queries, keys, values, tile_size=1024):
+    set_trace()
     m, d_k = queries.shape
     n, _ = keys.shape
     head_dim = d_k
