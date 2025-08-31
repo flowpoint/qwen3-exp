@@ -12,6 +12,7 @@ from tqdm import tqdm
 from pdb import set_trace
 from timeit import timeit
 import time
+import gc
 
 from math import ceil
 #from test5 import tiled_matmul_scan
@@ -490,63 +491,26 @@ def generate_kv_optimized(model, idx, max_new_tokens, context_size, temperature=
     #exit(0)
     print('prefilled')
 
-    '''
-    logits2, kv_cache2, position_offset2 = qwen3_forward_kv(params, cur_ids, cfg, kv_cache, position_offset, pre=True)
-    block([logits2, kv_cache2, position_offset2])
-
-    from time import perf_counter
-
-    for i in range(3):
-        stt = perf_counter()
-        #logits, kv_cache, position_offset = qwen3_forward_kv(params, cur_ids, cfg, kv_cache, position_offset, pre=True)
-        logits2, kv_cache2, position_offset2 = qwen3_forward_kv(params, cur_ids, cfg, kv_cache, position_offset, pre=True)
-        block([logits2, kv_cache2, position_offset2])
-        ft = perf_counter()
-        print(ft-stt)
-
-    set_trace()
-    '''
-
-
-    # get generation function
-    '''
-    f = steptop(params, cfg)
-    # prefill2
-    [logits, kv_cache, position_offset], _ = f([logits, kv_cache, position_offset], None)
-    block([logits, kv_cache, position_offset])
-    jax.clear_caches()
-    '''
-
-    '''
-    f = steptop(params, cfg)
-    # prefill2
-    [logits, kv_cache, position_offset], _ = f([logits, kv_cache, position_offset], None)
-    block([logits, kv_cache, position_offset])
-    jax.clear_caches()
-    '''
-
-
-    '''
-
     cur_ids2 = jnp.array([[999]*26])
 
     #logits, kv_cache, position_offset, cur_ids = gen(f, logits, kv_cache, position_offset, cur_ids2, max_new_tokens)
-    set_trace()
-    traced = jax.jit(gen, static_argnums=[3,4]).trace(params, logits, kv_cache, int(position_offset), max_new_tokens)
+    #set_trace()
+    #traced = jax.jit(gen, static_argnums=[3,4]).trace(params, logits, kv_cache, int(position_offset), max_new_tokens)
+    traced = jax.jit(gen, static_argnums=[4]).trace(params, logits, kv_cache, int(position_offset), max_new_tokens)
     lowered = traced.lower()
     compiled_gen = lowered.compile()
-    import gc
-    '''
 
-    use_lax = False
+    use_lax = True
     if use_lax:
         # warmup
         cur_ids3 = jnp.array([[1999]*26])
-        [params1,logits1, kv_cache1, position_offset1], seq2 = compiled_gen(params, logits, kv_cache)
-        block([params1, logits1, kv_cache1, position_offset1, seq2])
-        del logits1, kv_cache1, position_offset1, 
+        #[logits1, kv_cache1, position_offset1], seq = compiled_gen(params, logits, kv_cache)#, int(position_offset), max_new_tokens)
+        [logits1, kv_cache1, position_offset1], seq = compiled_gen(params, logits, kv_cache, int(position_offset))#, max_new_tokens)
+        block([logits1, kv_cache1, position_offset1, seq])
+        del logits1, kv_cache1, position_offset1
         gc.collect()
 
+        '''
         stt = time.time()
         [logits2, kv_cache2, position_offset2], seq2 = compiled_gen(logits, kv_cache)
         block([logits2, kv_cache2, position_offset2, seq2])
@@ -576,6 +540,7 @@ def generate_kv_optimized(model, idx, max_new_tokens, context_size, temperature=
 
         if profile:
             jax.profiler.stop_trace()
+        '''
     else:
         #set_trace()
         seq = []
