@@ -218,9 +218,9 @@ if __name__ == "__main__":
     tokenizer_path = model_path / "tokenizer.json"
     tokenizer = Qwen3Tokenizer(str(tokenizer_path) if tokenizer_path.exists() else "tokenizer.json", repo_id=HF_REPO_ID)
 
-    #pref_mul = 20_000
+    pref_mul = 20_000
     #pref_mul = 200
-    pref_mul = 1
+    #pref_mul = 1
     prompt = "Give me a short introduction to large language models."*pref_mul
     input_ids = tokenizer.encode(prompt)
     if len(input_ids) > QWEN3_CONFIG["context_length"]:
@@ -242,7 +242,7 @@ if __name__ == "__main__":
     
     # Generate with optimized function (batch_size=1 for single sequence)
     output_token_ids = generate_kv_optimized(
-        model=model, idx=input_token_ids, max_new_tokens=20,
+        model=model, idx=input_token_ids, max_new_tokens=120,
         context_size=QWEN3_CONFIG["context_length"], top_k=1,
         temperature=0, eos_id=None
     )

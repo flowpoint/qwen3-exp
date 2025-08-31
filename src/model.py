@@ -15,7 +15,6 @@ import time
 import gc
 
 from math import ceil
-#from test5 import tiled_matmul_scan
 
 bp = jax.debug.breakpoint
 
@@ -28,30 +27,6 @@ else:
     device =  jax.devices('cpu')[0]
 
 from model_utils import *
-
-
-#@jax.jit
-def tiled_matmul_scan(A, B, pre):
-    set_trace()
-    m, k = A.shape
-    k, n = B.shape
-    tile_size = m
-    #m, k = 40960, 128
-    #k, n = 128, 40960
-    #k0s = jnp.arange(0, k, tile_size)
-    C = jnp.zeros((m, n))
-    num_tiles = m // tile_size
-    A = jnp.reshape(A, [num_tiles, m // num_tiles])
-    B = jnp.reshape(B, [tile_size, n // tile_size])
-    xs = (A, B) #k0s,
-
-    def update_C(C, x):
-        A_block, B_block = x
-        #A_block = A[:, k0:k0 + tile_size]
-        #B_block = B[k0:k0 + tile_size, :]
-        return C + A_block @ B_block, None
-
-    return jax.lax.scan(update_C, C, k0s)[0]
 
 dtype = jax.dtypes.bfloat16
 #dtype = jnp.float16
@@ -91,7 +66,7 @@ def manual_vmap(att_head, queries, keys_expanded, values_expanded, pre, position
         queries, keys_expanded, values_expanded = x
         x = att_head(queries, keys_expanded, values_expanded, pre, position_offset)
         return carry, x
-    carry, xr = jax.lax.scan(bodyfn, None, xs=(queries, keys_expanded, values_expanded), unroll=False)
+    carry, xr = jax.lax.scan(bodyfn, None, xs=(queries, keys_expanded, values_expanded), unroll=True)
     return xr
 
 
@@ -107,7 +82,6 @@ def att_head_coder_causal(queries, keys, values, pre, position_offset, tile_size
 
     m, d_k = queries.shape
     n, _ = keys.shape
-    #m = 40960
     head_dim = d_k
 
     if pre:
@@ -187,9 +161,9 @@ def att_head_coder_causal(queries, keys, values, pre, position_offset, tile_size
     scan_inputs = (ks, vs, start_indices)
 
     if pre:
-        (Fn, Ln, _), _ = jax.lax.scan(causal_bodyfn_pre, init_pre, scan_inputs)
+        (Fn, Ln, _), _ = jax.lax.scan(causal_bodyfn_pre, init_pre, scan_inputs, unroll=1)#True)
     else:
-        (Fn, Ln, _, _), _ = jax.lax.scan(causal_bodyfn, init, scan_inputs)
+        (Fn, Ln, _, _), _ = jax.lax.scan(causal_bodyfn, init, scan_inputs, unroll=True)
     # no nans allowed
     # cant assert #assert jnp.all(Ln != 0.)
     # needs checkify wrapping #jax.experimental.checkify.check(jnp.all(Ln != 0, "null in softmax denominator"))
@@ -263,15 +237,14 @@ def grouped_query_attention_forward_kv(num_heads, num_kv_groups, head_dim, param
     if pre:
         kv_cache["keys"] = kv_cache["keys"].at[:,:,:keys.shape[2]].set(keys)
         kv_cache["values"] = kv_cache["values"].at[:,:,:values.shape[2]].set(values)
+
+        position_offset_new = keys.shape[2]
     else:
         kv_cache["keys"] = kv_cache["keys"].at[:,:,position_offset].set(keys[:,:,0])
         kv_cache["values"] = kv_cache["values"].at[:,:,position_offset].set(values[:,:,0])
         keys = kv_cache['keys']
         values = kv_cache['values']
 
-    if pre:
-        position_offset_new = keys.shape[2]
-    else:
         position_offset_new = position_offset + 1
         
     new_cache = kv_cache
@@ -290,7 +263,7 @@ def grouped_query_attention_forward_kv(num_heads, num_kv_groups, head_dim, param
 def rms2(norm1, x):
     return jax.vmap(lambda y: rmsnorm_forward(norm1, y))(x)
 
-@partial(jax.jit, static_argnums=[4], donate_argnums=[1])
+#@partial(jax.jit, static_argnums=[4], donate_argnums=[1])
 def transformer_block_forward_kv(params, kv_cache, position_offset, x, pre=False):
     shortcut = x
     x = rmsnorm_forward(params["norm1"], x)
@@ -347,32 +320,11 @@ def get_logits(cfg, x, params, vocab_chunk_size=128):
     logits = jnp.concatenate(logits_chunks, axis=1)
     return logits
 
-def tiled_matmul_s(x, y, pre):
-    '''
-    if pre:
-        tile_size=26
-    else:
-        '''
-    tile_size = 1
-    
-    def scan_body(carry, y_tile):
-        acc = carry
-        result_tile = jnp.einsum('se,ev->sv', x, y_tile)
-        acc = acc + result_tile
-        return acc, None
-    
-    y_tiles = y.reshape(y.shape[0] // tile_size, tile_size, y.shape[1])
-    init_acc = jnp.zeros((x.shape[0], y.shape[1]))
-    final_result, _ = jax.lax.scan(scan_body, init_acc, y_tiles)
-    return final_result
-
-
 #@partial(jax.jit, static_argnums=[5], donate_argnums=[3])
 def qwen3_forward_kv(params, x, cfg, kv_cache, position_offset, pre=False):
     x = params["tok_emb"][x]
 
     new_cache = {"keys": [], "values":[]}
-    #set_trace()
     for i, block_params in enumerate(params["trf_blocks"]):
         layer_cache = {"keys": kv_cache["keys"][:,i], "values": kv_cache["values"][:,i]}
         x, updated_cache, position_offset_new = transformer_block_forward_kv(block_params, layer_cache, position_offset, x, pre=pre)
@@ -382,17 +334,7 @@ def qwen3_forward_kv(params, x, cfg, kv_cache, position_offset, pre=False):
 
     x = rmsnorm_forward(params["final_norm"], x)
     # cant do logits on prefill because it would be of shape [ctxlen, vocab] <- too big
-    '''
-    if pre:
-        # just even logits as stub
-        vocab_size = cfg['vocab_size']
-        logits = jnp.ones([1,1,vocab_size]) / vocab_size
-    else:
-    '''
-    #set_trace()
-    logits = jnp.einsum('se,ev->sv', x[-1,-1:], params["out_head"])[None, :]
-        #logits = tiled_matmul_s(x[0], params['out_head'], pre)[None, :]
-    #logits = jnp.einsum('se,ev->sv', x[-1], params["out_head"])[None, :]
+    logits = jnp.matmul(x[-1,-1:], params["out_head"])[None, :]
     
     return logits, new_cache, position_offset_new
 
@@ -499,6 +441,7 @@ def generate_kv_optimized(model, idx, max_new_tokens, context_size, temperature=
     traced = jax.jit(gen, static_argnums=[4]).trace(params, logits, kv_cache, int(position_offset), max_new_tokens)
     lowered = traced.lower()
     compiled_gen = lowered.compile()
+    print('compiled')
 
     use_lax = True
     if use_lax:
@@ -510,17 +453,6 @@ def generate_kv_optimized(model, idx, max_new_tokens, context_size, temperature=
         del logits1, kv_cache1, position_offset1
         gc.collect()
 
-        '''
-        stt = time.time()
-        [logits2, kv_cache2, position_offset2], seq2 = compiled_gen(logits, kv_cache)
-        block([logits2, kv_cache2, position_offset2, seq2])
-        fin = time.time()
-        del logits2, kv_cache2, position_offset2, 
-        print(f"time: {fin-stt}")
-        gc.collect()
-
-        time.sleep(5)
-
         stt = time.time()
         options = jax.profiler.ProfileOptions()
         options.python_tracer_level = 0
@@ -530,17 +462,25 @@ def generate_kv_optimized(model, idx, max_new_tokens, context_size, temperature=
         if profile:
             jax.profiler.start_trace("/tmp/jax-trace1")#, profiler_options=options)
 
-        [logits2, kv_cache2, position_offset2], seq = compiled_gen(logits, kv_cache )
-        block([logits2, kv_cache2, position_offset2, seq])
-        fin = time.time()
-        del logits2, kv_cache2, position_offset2, 
-        tps = max_new_tokens / (fin-stt) 
-        print(f"time: {fin-stt} for {max_new_tokens} at {tps} tok/s")
-        gc.collect()
+        '''
+        cur_ids3 = jnp.array([[1999]*26])
+        #[logits1, kv_cache1, position_offset1], seq = compiled_gen(params, logits, kv_cache)#, int(position_offset), max_new_tokens)
+        [logits1, kv_cache1, position_offset1], seq = compiled_gen(params, logits, kv_cache, int(position_offset))#, max_new_tokens)
+        block([logits1, kv_cache1, position_offset1, seq])
+        '''
+
+        stt = time.perf_counter()
+        cur_ids3 = jnp.array([[1999]*26])
+        #[logits1, kv_cache1, position_offset1], seq = compiled_gen(params, logits, kv_cache)#, int(position_offset), max_new_tokens)
+        [logits1, kv_cache1, position_offset1], seq = compiled_gen(params, logits, kv_cache, int(position_offset))#, max_new_tokens)
+        block([logits1, kv_cache1, position_offset1, seq])
+        ft = time.perf_counter()
+        tt = ft - stt
+        toks = 2*max_new_tokens
+        print(f"took: {tt} for {2*max_new_tokens} at {toks/tt} toks/sec")
 
         if profile:
             jax.profiler.stop_trace()
-        '''
     else:
         #set_trace()
         seq = []
