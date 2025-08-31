@@ -14,6 +14,7 @@ from timeit import timeit
 import time
 
 from math import ceil
+#from test5 import tiled_matmul_scan
 
 bp = jax.debug.breakpoint
 
@@ -27,10 +28,35 @@ else:
 
 from model_utils import *
 
+
+#@jax.jit
+def tiled_matmul_scan(A, B, pre):
+    set_trace()
+    m, k = A.shape
+    k, n = B.shape
+    tile_size = m
+    #m, k = 40960, 128
+    #k, n = 128, 40960
+    #k0s = jnp.arange(0, k, tile_size)
+    C = jnp.zeros((m, n))
+    num_tiles = m // tile_size
+    A = jnp.reshape(A, [num_tiles, m // num_tiles])
+    B = jnp.reshape(B, [tile_size, n // tile_size])
+    xs = (A, B) #k0s,
+
+    def update_C(C, x):
+        A_block, B_block = x
+        #A_block = A[:, k0:k0 + tile_size]
+        #B_block = B[k0:k0 + tile_size, :]
+        return C + A_block @ B_block, None
+
+    return jax.lax.scan(update_C, C, k0s)[0]
+
 dtype = jax.dtypes.bfloat16
 #dtype = jnp.float16
 #dtype = jnp.float32
 cl = 40960
+#cl = 8192
 #cl = 1024
 
 cfg = {
@@ -71,21 +97,27 @@ def manual_vmap(att_head, queries, keys_expanded, values_expanded, pre, position
 
 #@partial(jax.jit, static_argnums=[3])
 def att_head_coder_causal(queries, keys, values, pre, position_offset, tile_size=1024):
-    if pre:
-        # make tilesize match the tiny prefill
-        if queries.shape[0] % tile_size != 0:
-            tile_size = queries.shape[0]
-    else:
-        tile_size = 1024
-    #set_trace()
-    dtype_l = jnp.float64
+    #dtype_l = jnp.float64
+    #dtype_l = jnp.bfloat16
+    dtype_l = dtype
     queries = queries.astype(dtype_l)
     keys = keys.astype(dtype_l)
     values = values.astype(dtype_l)
 
     m, d_k = queries.shape
     n, _ = keys.shape
+    #m = 40960
     head_dim = d_k
+
+    if pre:
+        # only needed during prefill, otherwise m is 1, bc 1 token decode
+        pass#assert m % tile_size == 0, f"input shape must be padded to tile_size: {tile_size} but is {m}"
+    if pre:
+        # make tile_size match the tiny prefill
+        if m % tile_size != 0:
+            tile_size = queries.shape[0]
+    else:
+        tile_size = 1024
 
     Fi = jnp.zeros((m, values.shape[-1]), dtype=dtype_l)
     Li = jnp.zeros((m, 1), dtype=dtype_l)
@@ -105,29 +137,13 @@ def att_head_coder_causal(queries, keys, values, pre, position_offset, tile_size
     #bp()
 
     def causal_bodyfn(carry, scan_input):
-        #set_trace()
-        #bp()
         k_chunk, v_chunk, start_idx = scan_input
         F, L, M, position_offset = carry
-        #jax.debug.print("pos: {0}", position_offset)
         logits = jnp.matmul(queries, k_chunk.T) / jnp.sqrt(head_dim)  # (m, tile_sz)
         k_positions = jnp.arange(tile_size)[None, :] + start_idx  # (1, tile_sz)
 
-        '''
-        if pre:
-            # Causal masking
-            q_positions = jnp.arange(m)[:, None]  # (m, 1)
-            causal_mask = k_positions > q_positions  # (m, tile_sz)
-        else:
-            causal_mask = k_positions > (position_offset + 1)  # (m, tile_sz)
-            '''
-
+        # causal mask generation
         causal_mask = k_positions > (position_offset + 1)  # (m, tile_sz)
-        '''
-        q_positions = jnp.arange(m)[:, None]  # (m, 1)
-        causal_mask = k_positions > q_positions  # (m, tile_sz)
-        causal_mask2 = k_positions > (position_offset + 1)  # (m, tile_sz)
-        '''
 
         logits = jnp.where(causal_mask, -jnp.inf, logits)
 
@@ -143,20 +159,16 @@ def att_head_coder_causal(queries, keys, values, pre, position_offset, tile_size
         return (F2, L2, M2, position_offset), None
 
     def causal_bodyfn_pre(carry, scan_input):
-        jax.debug.print("running prefill {0}", position_offset)
-        print('prefill att')
         k_chunk, v_chunk, start_idx = scan_input
         F, L, M, = carry
         logits = jnp.matmul(queries, k_chunk.T) / jnp.sqrt(head_dim)  # (m, tile_sz)
         k_positions = jnp.arange(tile_size)[None, :] + start_idx  # (1, tile_sz)
 
-        # Causal masking
+        # Causal masking prefill
         q_positions = jnp.arange(m)[:, None]  # (m, 1)
         causal_mask = k_positions > q_positions  # (m, tile_sz)
 
         logits = jnp.where(causal_mask, -jnp.inf, logits)
-        #bp()
-        #set_trace()
 
         # Softmax
         max_logits = jnp.max(logits, axis=-1, keepdims=True)
@@ -177,7 +189,9 @@ def att_head_coder_causal(queries, keys, values, pre, position_offset, tile_size
         (Fn, Ln, _), _ = jax.lax.scan(causal_bodyfn_pre, init_pre, scan_inputs)
     else:
         (Fn, Ln, _, _), _ = jax.lax.scan(causal_bodyfn, init, scan_inputs)
-    #assert jnp.any(L != 0.)
+    # no nans allowed
+    # cant assert #assert jnp.all(Ln != 0.)
+    # needs checkify wrapping #jax.experimental.checkify.check(jnp.all(Ln != 0, "null in softmax denominator"))
     return (Fn / Ln).astype(dtype)
     #return jnp.where(L != 0, F / L, 0.0)
 
@@ -275,6 +289,7 @@ def grouped_query_attention_forward_kv(num_heads, num_kv_groups, head_dim, param
 def rms2(norm1, x):
     return jax.vmap(lambda y: rmsnorm_forward(norm1, y))(x)
 
+@partial(jax.jit, static_argnums=[4], donate_argnums=[1])
 def transformer_block_forward_kv(params, kv_cache, position_offset, x, pre=False):
     shortcut = x
     x = rmsnorm_forward(params["norm1"], x)
@@ -331,8 +346,27 @@ def get_logits(cfg, x, params, vocab_chunk_size=128):
     logits = jnp.concatenate(logits_chunks, axis=1)
     return logits
 
+def tiled_matmul_s(x, y, pre):
+    '''
+    if pre:
+        tile_size=26
+    else:
+        '''
+    tile_size = 1
+    
+    def scan_body(carry, y_tile):
+        acc = carry
+        result_tile = jnp.einsum('se,ev->sv', x, y_tile)
+        acc = acc + result_tile
+        return acc, None
+    
+    y_tiles = y.reshape(y.shape[0] // tile_size, tile_size, y.shape[1])
+    init_acc = jnp.zeros((x.shape[0], y.shape[1]))
+    final_result, _ = jax.lax.scan(scan_body, init_acc, y_tiles)
+    return final_result
 
-@partial(jax.jit, static_argnums=[5], donate_argnums=[3])
+
+#@partial(jax.jit, static_argnums=[5], donate_argnums=[3])
 def qwen3_forward_kv(params, x, cfg, kv_cache, position_offset, pre=False):
     x = params["tok_emb"][x]
 
@@ -346,7 +380,18 @@ def qwen3_forward_kv(params, x, cfg, kv_cache, position_offset, pre=False):
     new_cache = kv_cache
 
     x = rmsnorm_forward(params["final_norm"], x)
-    logits = jnp.einsum('bse,ev->bsv', x, params["out_head"])
+    # cant do logits on prefill because it would be of shape [ctxlen, vocab] <- too big
+    '''
+    if pre:
+        # just even logits as stub
+        vocab_size = cfg['vocab_size']
+        logits = jnp.ones([1,1,vocab_size]) / vocab_size
+    else:
+    '''
+    #set_trace()
+    logits = jnp.einsum('se,ev->sv', x[-1,-1:], params["out_head"])[None, :]
+        #logits = tiled_matmul_s(x[0], params['out_head'], pre)[None, :]
+    #logits = jnp.einsum('se,ev->sv', x[-1], params["out_head"])[None, :]
     
     return logits, new_cache, position_offset_new
 
