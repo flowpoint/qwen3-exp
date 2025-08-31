@@ -13,6 +13,8 @@ from pdb import set_trace
 from timeit import timeit
 import time
 
+from math import ceil
+
 bp = jax.debug.breakpoint
 
 from functools import partial, reduce
@@ -25,11 +27,11 @@ else:
 
 from model_utils import *
 
-#dtype = jax.dtypes.bfloat16
+dtype = jax.dtypes.bfloat16
 #dtype = jnp.float16
-dtype = jnp.float32
-#cl = 40960
-cl = 1024
+#dtype = jnp.float32
+cl = 40960
+#cl = 1024
 
 cfg = {
     "vocab_size": 151936, "context_length": cl, "emb_dim": 1024, "n_heads": 16,
@@ -69,6 +71,12 @@ def manual_vmap(att_head, queries, keys_expanded, values_expanded, pre, position
 
 #@partial(jax.jit, static_argnums=[3])
 def att_head_coder_causal(queries, keys, values, pre, position_offset, tile_size=1024):
+    if pre:
+        # make tilesize match the tiny prefill
+        if queries.shape[0] % tile_size != 0:
+            tile_size = queries.shape[0]
+    else:
+        tile_size = 1024
     #set_trace()
     dtype_l = jnp.float64
     queries = queries.astype(dtype_l)
@@ -83,7 +91,14 @@ def att_head_coder_causal(queries, keys, values, pre, position_offset, tile_size
     Li = jnp.zeros((m, 1), dtype=dtype_l)
     Mi = jnp.full((m, 1), -jnp.inf, dtype=dtype_l)
     init = (Fi, Li, Mi, position_offset)
+    init_pre = (Fi, Li, Mi)
 
+    #num_full_tiles = ceil(n / tile_size)
+    '''
+    context_size = cfg['context_length']
+    num_full_tiles = context_size // tile_size
+    assert context_size % tile_size == 0
+    '''
     num_full_tiles = n // tile_size
     ks = jnp.reshape(keys[:num_full_tiles * tile_size], (num_full_tiles, tile_size, d_k))
     vs = jnp.reshape(values[:num_full_tiles * tile_size], (num_full_tiles, tile_size, d_k))
@@ -128,11 +143,10 @@ def att_head_coder_causal(queries, keys, values, pre, position_offset, tile_size
         return (F2, L2, M2, position_offset), None
 
     def causal_bodyfn_pre(carry, scan_input):
-        #set_trace()
-        #bp()
+        jax.debug.print("running prefill {0}", position_offset)
+        print('prefill att')
         k_chunk, v_chunk, start_idx = scan_input
-        F, L, M, position_offset = carry
-        #jax.debug.print("pos: {0}", position_offset)
+        F, L, M, = carry
         logits = jnp.matmul(queries, k_chunk.T) / jnp.sqrt(head_dim)  # (m, tile_sz)
         k_positions = jnp.arange(tile_size)[None, :] + start_idx  # (1, tile_sz)
 
@@ -141,6 +155,8 @@ def att_head_coder_causal(queries, keys, values, pre, position_offset, tile_size
         causal_mask = k_positions > q_positions  # (m, tile_sz)
 
         logits = jnp.where(causal_mask, -jnp.inf, logits)
+        #bp()
+        #set_trace()
 
         # Softmax
         max_logits = jnp.max(logits, axis=-1, keepdims=True)
@@ -151,16 +167,16 @@ def att_head_coder_causal(queries, keys, values, pre, position_offset, tile_size
         F2 = F * old_shift + jnp.matmul(exp_logits, v_chunk)
         M2 = new_max
 
-        return (F2, L2, M2, position_offset), None
+        return (F2, L2, M2), None
 
     # Pass start indices with chunks
     start_indices = jnp.arange(0, num_full_tiles * tile_size, tile_size)
     scan_inputs = (ks, vs, start_indices)
 
     if pre:
-        (Fn, Ln, _, _), _ = jax.lax.scan(causal_bodyfn_pre, init, scan_inputs)
+        (Fn, Ln, _), _ = jax.lax.scan(causal_bodyfn_pre, init_pre, scan_inputs)
     else:
-        (Fn, Ln, _, _), _ = jax.lax.scan(causal_bodyfn_pre, init, scan_inputs)
+        (Fn, Ln, _, _), _ = jax.lax.scan(causal_bodyfn, init, scan_inputs)
     #assert jnp.any(L != 0.)
     return (Fn / Ln).astype(dtype)
     #return jnp.where(L != 0, F / L, 0.0)
@@ -189,15 +205,15 @@ def att_head_orig(queries, keys_expanded, values_expanded, pre, position_offset)
 #partial(jax.jit, static_argnums=[])
 def att2(queries, keys_expanded, values_expanded, out_proj, pre, position_offset):
     #set_trace()
-    tiled = False
-    comp = False
+    run = True
+    tiled = True
 
-    if tiled:
-        context = manual_vmap(att_head_coder_causal, queries, keys_expanded, values_expanded, pre, position_offset)
+    if run:
+        if tiled == True:
+            context = manual_vmap(att_head_coder_causal, queries, keys_expanded, values_expanded, pre, position_offset)
+        else:
+            context = manual_vmap(att_head_orig, queries, keys_expanded, values_expanded, pre, position_offset)
     else:
-        context = manual_vmap(att_head_orig, queries, keys_expanded, values_expanded, pre, position_offset)
-
-    if comp:
         context = manual_vmap(att_head_orig, queries, keys_expanded, values_expanded, pre, position_offset)
         context2 = manual_vmap(att_head_coder_causal, queries, keys_expanded, values_expanded, pre, position_offset)
         if not jnp.allclose(context, context2): #jnp.any(context - context1 > 0.001):
@@ -227,7 +243,7 @@ def grouped_query_attention_forward_kv(num_heads, num_kv_groups, head_dim, param
 
     queries = apply_rope_with_offset(queries, cos, sin, position_offset)
     keys = apply_rope_with_offset(keys, cos, sin, position_offset)
-    set_trace()
+    #set_trace()
     
     if pre:
         kv_cache["keys"] = kv_cache["keys"].at[:,:,:keys.shape[2]].set(keys)
@@ -316,7 +332,7 @@ def get_logits(cfg, x, params, vocab_chunk_size=128):
     return logits
 
 
-#@partial(jax.jit, static_argnums=[5], donate_argnums=[3])
+@partial(jax.jit, static_argnums=[5], donate_argnums=[3])
 def qwen3_forward_kv(params, x, cfg, kv_cache, position_offset, pre=False):
     x = params["tok_emb"][x]
 
@@ -426,6 +442,8 @@ def generate_kv_optimized(model, idx, max_new_tokens, context_size, temperature=
     #if 0:
     logits, kv_cache, position_offset = qwen3_forward_kv(params, cur_ids, cfg, kv_cache, position_offset, pre=True)
     block([logits, kv_cache, position_offset])
+    #exit(0)
+    print('prefilled')
 
     '''
     logits2, kv_cache2, position_offset2 = qwen3_forward_kv(params, cur_ids, cfg, kv_cache, position_offset, pre=True)
@@ -453,11 +471,16 @@ def generate_kv_optimized(model, idx, max_new_tokens, context_size, temperature=
     block([logits, kv_cache, position_offset])
     jax.clear_caches()
     '''
+
+    '''
     f = steptop(params, cfg)
     # prefill2
     [logits, kv_cache, position_offset], _ = f([logits, kv_cache, position_offset], None)
     block([logits, kv_cache, position_offset])
     jax.clear_caches()
+    '''
+
+
     '''
 
     cur_ids2 = jnp.array([[999]*26])
