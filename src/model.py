@@ -72,7 +72,7 @@ def manual_vmap(att_head, queries, keys_expanded, values_expanded, pre, position
 
 
 #@partial(jax.jit, static_argnums=[3])
-def att_head_coder_causal(queries, keys, values, pre, position_offset, tile_size=1024):
+def att_head_coder_causal(queries, keys, values, pre, position_offset, tile_size=2*1024):
     #dtype_l = jnp.float64
     #dtype_l = jnp.bfloat16
     dtype_l = dtype
@@ -161,9 +161,9 @@ def att_head_coder_causal(queries, keys, values, pre, position_offset, tile_size
     scan_inputs = (ks, vs, start_indices)
 
     if pre:
-        (Fn, Ln, _), _ = jax.lax.scan(causal_bodyfn_pre, init_pre, scan_inputs, unroll=1)#True)
+        (Fn, Ln, _), _ = jax.lax.scan(causal_bodyfn_pre, init_pre, scan_inputs, unroll=4)
     else:
-        (Fn, Ln, _, _), _ = jax.lax.scan(causal_bodyfn, init, scan_inputs, unroll=True)
+        (Fn, Ln, _, _), _ = jax.lax.scan(causal_bodyfn, init, scan_inputs, unroll=4)
     # no nans allowed
     # cant assert #assert jnp.all(Ln != 0.)
     # needs checkify wrapping #jax.experimental.checkify.check(jnp.all(Ln != 0, "null in softmax denominator"))
@@ -256,7 +256,11 @@ def grouped_query_attention_forward_kv(num_heads, num_kv_groups, head_dim, param
     keys_expanded = keys_expanded[0]
     values_expanded = values_expanded[0]
 
-    output = att2(queries, keys_expanded, values_expanded, params['out_proj'], pre, position_offset)[None,:]
+    if pre:
+        output = att2(queries, keys_expanded, values_expanded, params['out_proj'], pre, position_offset)[None,:]
+    else:
+        qp = jax.lax.dynamic_slice(queries, (0, position_offset,0), (16,1,128))
+        output = att2(qp, keys_expanded, values_expanded, params['out_proj'], pre, position_offset)[None,:]
 
     return output, new_cache, position_offset_new
 
@@ -426,11 +430,32 @@ def generate_kv_optimized(model, idx, max_new_tokens, context_size, temperature=
     print(f"cache size is: {fs_gb} GB")
     position_offset = 0
     
-    # prefill1
-    #if 0:
-    logits, kv_cache, position_offset = qwen3_forward_kv(params, cur_ids, cfg, kv_cache, position_offset, pre=True)
+    options = jax.profiler.ProfileOptions()
+    options.python_tracer_level = 0
+    options.host_tracer_level = 3
+    #with jax.profiler.trace("/tmp/jax-trace1", create_perfetto_link=True):
+
+    # compile prefill1
+    traced_pre = jax.jit(qwen3_forward_kv, static_argnums=[4,5], donate_argnums=[3]).trace(
+            params, cur_ids, cfg, kv_cache, position_offset, pre=True)
+    lowered = traced_pre.lower()
+    compiled_pre = lowered.compile()
+
+    # run prefill
+    stt = time.perf_counter()
+    profile = False
+    if profile:
+        jax.profiler.start_trace("/tmp/jax-trace1")#, profiler_options=options)
+
+    logits, kv_cache, position_offset = compiled_pre(params, cur_ids, cfg, kv_cache)
     block([logits, kv_cache, position_offset])
-    #exit(0)
+
+    if profile:
+        jax.profiler.stop_trace()
+    ft = time.perf_counter()
+    tt = ft - stt
+    toks = 2*max_new_tokens
+    print(f"took: {tt} for {2*max_new_tokens} at {toks/tt} toks/sec")
     print('prefilled')
 
     cur_ids2 = jnp.array([[999]*26])
@@ -454,10 +479,6 @@ def generate_kv_optimized(model, idx, max_new_tokens, context_size, temperature=
         gc.collect()
 
         stt = time.time()
-        options = jax.profiler.ProfileOptions()
-        options.python_tracer_level = 0
-        options.host_tracer_level = 3
-        #with jax.profiler.trace("/tmp/jax-trace1", create_perfetto_link=True):
         profile = False
         if profile:
             jax.profiler.start_trace("/tmp/jax-trace1")#, profiler_options=options)
