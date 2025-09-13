@@ -200,24 +200,19 @@ def att2(queries, keys_expanded, values_expanded, out_proj, pre, position_offset
 def grouped_query_attention_forward_kv(num_heads, num_kv_groups, head_dim, params, kv_cache, qk_norm, position_offset, x, pre=False):
     cos, sin = compute_rope_params(cfg["head_dim"], cfg["rope_base"], cfg["context_length"])
     seq, d_in = x.shape
-    group_size = num_heads // num_kv_groups
-
     if not pre:
-        pass
-        #set_trace()
-        #query_W = jax.lax.dynamic_slice(params["W_query"], (0, position_offset,0), (16,1,128))
-
-    #bp()
-    
-    queries = jnp.einsum('sd,dh->sh', x, params["W_query"]).reshape(seq, num_heads, head_dim).transpose(1,0,2)
-    keys = jnp.einsum('sd,dh->sh', x, params["W_key"]).reshape(seq, num_kv_groups, head_dim).transpose(1,0,2)
-
-    if qk_norm and "q_norm" in params and "k_norm" in params:
-        queries = apply_qk_norm(queries, params["q_norm"])
-        keys = apply_qk_norm(keys, params["k_norm"])
-
+        assert seq == 1
+    group_size = num_heads // num_kv_groups
     
     if pre:
+        queries = jnp.einsum('sd,dh->sh', x, params["W_query"]).reshape(seq, num_heads, head_dim).transpose(1,0,2)
+        keys = jnp.einsum('sd,dh->sh', x, params["W_key"]).reshape(seq, num_kv_groups, head_dim).transpose(1,0,2)
+
+        if qk_norm and "q_norm" in params and "k_norm" in params:
+            queries = apply_qk_norm(queries, params["q_norm"])
+            keys = apply_qk_norm(keys, params["k_norm"])
+
+
         queries = apply_rope_with_offset(queries[None], cos, sin, position_offset)[0]
         keys = apply_rope_with_offset(keys[None], cos, sin, position_offset)[0]
         values = jnp.einsum('sd,dh->sh', x, params["W_value"]).reshape(seq, num_kv_groups, head_dim).transpose(1,0,2)
@@ -228,18 +223,25 @@ def grouped_query_attention_forward_kv(num_heads, num_kv_groups, head_dim, param
         #keys = kv_cache['keys'][0]
         #values = kv_cache['values'][0]
     else:
-        queries = apply_rope_with_offset(queries[None], cos, sin, position_offset)[0]
-        keys = apply_rope_with_offset(keys[None, :, 0:1], cos, sin, position_offset)[0, :, 0:1]
-        #values = jnp.einsum('sd,dh->sh', x, params["W_value"]).reshape(seq, num_kv_groups, head_dim).transpose(1,0,2)[:, 0:1]
         # during inference seqlen (new prefill tokens) is 1
-        values = jnp.einsum('sd,dh->sh', x, params["W_value"])[0].reshape(num_kv_groups, 1, head_dim)
-        #set_trace()
+        queries = jnp.einsum('d,dh->h', x[0], params["W_query"]).reshape(num_heads, head_dim)[:, None]
+        keys = jnp.einsum('d,dh->h', x[0], params["W_key"]).reshape(num_kv_groups, head_dim)[:, None]
+
+        if qk_norm and "q_norm" in params and "k_norm" in params:
+            queries = apply_qk_norm(queries, params["q_norm"])
+            keys = apply_qk_norm(keys, params["k_norm"])
+
+        queries = apply_rope_with_offset(queries[None], cos, sin, position_offset)[0]
+        keys = apply_rope_with_offset(keys[None, :, 0:1], cos, sin, position_offset)[0, :, 0]
+
+        #values = jnp.einsum('sd,dh->sh', x, params["W_value"]).reshape(seq, num_kv_groups, head_dim).transpose(1,0,2)[:, 0:1]
+        values = jnp.einsum('d,dh->h', x[0], params["W_value"]).reshape(num_kv_groups, head_dim)
 
         #keys2 = jnp.concat([kv_cache['keys'][0,:,:26], keys[:,0]])[0]
         #values2 = jnp.concat([kv_cache['values'][0,:,:26], values[:,0]])[0]
 
-        kv_cache["keys"] = kv_cache["keys"].at[0,:,position_offset].set(keys[:,0])
-        kv_cache["values"] = kv_cache["values"].at[0,:,position_offset].set(values[:,0])
+        kv_cache["keys"] = kv_cache["keys"].at[0,:,position_offset].set(keys)
+        kv_cache["values"] = kv_cache["values"].at[0,:,position_offset].set(values)
 
         # this still atm runs the whole seqlen of the kv cache
         # batch, heads, seqlen, embdim
