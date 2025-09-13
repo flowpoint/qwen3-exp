@@ -145,7 +145,7 @@ def att_head_coder_causal(queries, keys, values, pre, position_offset, tile_size
     if pre:
         (Fn, Ln, _), _ = jax.lax.scan(causal_bodyfn_pre, init_pre, scan_inputs, unroll=False)
     else:
-        (Fn, Ln, _, _), _ = jax.lax.scan(causal_bodyfn, init, scan_inputs, unroll=False)
+        (Fn, Ln, _, _), _ = jax.lax.scan(causal_bodyfn, init, scan_inputs, unroll=True)
 
     # no nans allowed
     # cant assert #assert jnp.all(Ln != 0.)
@@ -281,42 +281,74 @@ def grouped_query_attention_forward_kv(num_heads, num_kv_groups, head_dim, param
         context = context.transpose(1,0,2).reshape(qp.shape[1], cfg['n_heads'] * cfg['head_dim'])
         output = jnp.einsum('sh,hd->sd', context, params['out_proj'])
 
-    return output[None], new_cache, position_offset_new
+    return output, new_cache, position_offset_new
 
 
 #@partial(jax.jit, static_argnums=[4], donate_argnums=[1])
 def transformer_block_forward_kv(params, kv_cache, position_offset, x, pre=False):
     shortcut = x
     x = rmsnorm_forward(params["norm1"], x)
-    if pre:
-        x, new_cache, position_offset = grouped_query_attention_forward_kv(cfg["n_heads"], cfg["n_kv_groups"], cfg["head_dim"], params["att"], kv_cache, cfg["qk_norm"], position_offset, x[0], pre)
-    else: 
-        x, new_cache, position_offset = grouped_query_attention_forward_kv(cfg["n_heads"], cfg["n_kv_groups"], cfg["head_dim"], params["att"], kv_cache, cfg["qk_norm"], position_offset, x[0, 0], pre)
+    x, new_cache, position_offset = grouped_query_attention_forward_kv(cfg["n_heads"], cfg["n_kv_groups"], cfg["head_dim"], params["att"], kv_cache, cfg["qk_norm"], position_offset, x, pre)
     x = x + shortcut
     shortcut = x
     x = rmsnorm_forward(params["norm2"], x)
-    x = feedforward_forward(params["ff"], x)
+    x = feedforward_forward(params["ff"], x[None])
     return x + shortcut, new_cache, position_offset
 
 
 #@partial(jax.jit, static_argnums=[5], donate_argnums=[3])
 def qwen3_forward_kv(params, x, cfg, kv_cache, position_offset, pre=False):
-    x = params["tok_emb"][x]
+    if pre:
+        # unbatch
+        x = x[0]
+    else:
+        # unbatch and unseq
+        x = x[0,0]
 
+    x = params["tok_emb"][x]
     new_cache = {"keys": [], "values":[]}
+
     for i, block_params in enumerate(params["trf_blocks"]):
         layer_cache = {"keys": kv_cache["keys"][:,i], "values": kv_cache["values"][:,i]}
         x, updated_cache, position_offset_new = transformer_block_forward_kv(block_params, layer_cache, position_offset, x, pre=pre)
         kv_cache['keys'] = kv_cache['keys'].at[:,i].set(updated_cache['keys'])
         kv_cache['values'] = kv_cache['values'].at[:,i].set(updated_cache['values'])
+        if pre:
+            x = x[0]
+        else:
+            x = x[0,0]
+
     new_cache = kv_cache
 
     x = rmsnorm_forward(params["final_norm"], x)
     # cant do logits on prefill because it would be of shape [ctxlen, vocab] <- too big
-    logits = jnp.matmul(x[-1,-1:], params["out_head"])[None, :]
+    if pre:
+        logits = jnp.matmul(x[-1:], params["out_head"])[None, :]
+    else:
+        logits = jnp.matmul(x[None], params["out_head"])[None, :]
     
     return logits, new_cache, position_offset_new
 
+def qwen3_forward_kv2(params, x, cfg, kv_cache, position_offset, pre=False):
+    x = params["tok_emb"][x]
+    set_trace()
+    keys = kv_cache["keys"]
+    vals = kv_cache["values"]
+
+    def scan_fn(carry, block_params):
+        kv_cache, position_offset = carry
+        layer_cache = {"keys": kv_cache["keys"][:,i], "values": kv_cache["values"][:,i]}
+        x, updated_cache, position_offset_new = transformer_block_forward_kv(block_params, layer_cache, position_offset, x, pre=pre)
+        kv_cache['keys'] = kv_cache['keys'].at[:,i].set(updated_cache['keys'])
+        kv_cache['values'] = kv_cache['values'].at[:,i].set(updated_cache['values'])
+        return (kv_cache, position_offset_new), None
+    
+    kv_cache, position_offset_new = jax.lax.scan(scan_fn, init=(x), xs=[kv_cache, params["trf_blocks"]])
+    
+    x = rmsnorm_forward(params["final_norm"], x)
+    logits = jnp.matmul(x[-1,-1:], params["out_head"])[None, :]
+    
+    return logits, kv_cache, position_offset_new
 
 #scan(step, init=[params, cfg, kv_cache])(next_token, position_offset)
 def decode_step(carry,x):#logits, kv_cache, position_offset, cur_ids):
@@ -334,7 +366,8 @@ def gen(params, logits, kv_cache, position_offset,  max_new_tokens):
     [params, logits, kv_cache, position_offset], seq = jax.lax.scan(
             decode_step, 
             init=[params, logits, kv_cache, position_offset], length=max_new_tokens,
-            unroll=5, #20, # unroll = 2 crashes with internal error, unroll = 3 produces different result, false, 4, 5 are fine
+            unroll=1, #20, # unroll = 2 crashes with internal error, unroll = 3 produces different result, false, 4, 5 are fine
+            # unroll 6 also is different like unroll 3
             )
     return [logits, kv_cache, position_offset], seq
 
