@@ -199,10 +199,11 @@ def att2(queries, keys_expanded, values_expanded, out_proj, pre, position_offset
 #@partial(jax.jit, static_argnums=[0,1,2,7,])
 def grouped_query_attention_forward_kv(num_heads, num_kv_groups, head_dim, params, kv_cache, qk_norm, position_offset, x, pre=False):
     cos, sin = compute_rope_params(cfg["head_dim"], cfg["rope_base"], cfg["context_length"])
-    seq, d_in = x.shape
-    if not pre:
-        assert seq == 1
     group_size = num_heads // num_kv_groups
+    if pre:
+        seq, d_in = x.shape
+    else:
+        d_in = x.shape
     
     if pre:
         queries = jnp.einsum('sd,dh->sh', x, params["W_query"]).reshape(seq, num_heads, head_dim).transpose(1,0,2)
@@ -224,8 +225,8 @@ def grouped_query_attention_forward_kv(num_heads, num_kv_groups, head_dim, param
         #values = kv_cache['values'][0]
     else:
         # during inference seqlen (new prefill tokens) is 1
-        queries = jnp.einsum('d,dh->h', x[0], params["W_query"]).reshape(num_heads, head_dim)[:, None]
-        keys = jnp.einsum('d,dh->h', x[0], params["W_key"]).reshape(num_kv_groups, head_dim)[:, None]
+        queries = jnp.einsum('d,dh->h', x, params["W_query"]).reshape(num_heads, head_dim)[:, None]
+        keys = jnp.einsum('d,dh->h', x, params["W_key"]).reshape(num_kv_groups, head_dim)[:, None]
 
         if qk_norm and "q_norm" in params and "k_norm" in params:
             queries = apply_qk_norm(queries, params["q_norm"])
@@ -235,7 +236,7 @@ def grouped_query_attention_forward_kv(num_heads, num_kv_groups, head_dim, param
         keys = apply_rope_with_offset(keys[None, :, 0:1], cos, sin, position_offset)[0, :, 0]
 
         #values = jnp.einsum('sd,dh->sh', x, params["W_value"]).reshape(seq, num_kv_groups, head_dim).transpose(1,0,2)[:, 0:1]
-        values = jnp.einsum('d,dh->h', x[0], params["W_value"]).reshape(num_kv_groups, head_dim)
+        values = jnp.einsum('d,dh->h', x, params["W_value"]).reshape(num_kv_groups, head_dim)
 
         #keys2 = jnp.concat([kv_cache['keys'][0,:,:26], keys[:,0]])[0]
         #values2 = jnp.concat([kv_cache['values'][0,:,:26], values[:,0]])[0]
@@ -277,7 +278,10 @@ def grouped_query_attention_forward_kv(num_heads, num_kv_groups, head_dim, param
 def transformer_block_forward_kv(params, kv_cache, position_offset, x, pre=False):
     shortcut = x
     x = rmsnorm_forward(params["norm1"], x)
-    x, new_cache, position_offset = grouped_query_attention_forward_kv(cfg["n_heads"], cfg["n_kv_groups"], cfg["head_dim"], params["att"], kv_cache, cfg["qk_norm"], position_offset, x[0], pre)
+    if pre:
+        x, new_cache, position_offset = grouped_query_attention_forward_kv(cfg["n_heads"], cfg["n_kv_groups"], cfg["head_dim"], params["att"], kv_cache, cfg["qk_norm"], position_offset, x[0], pre)
+    else: 
+        x, new_cache, position_offset = grouped_query_attention_forward_kv(cfg["n_heads"], cfg["n_kv_groups"], cfg["head_dim"], params["att"], kv_cache, cfg["qk_norm"], position_offset, x[0, 0], pre)
     x = x + shortcut
     shortcut = x
     x = rmsnorm_forward(params["norm2"], x)
