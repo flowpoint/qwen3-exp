@@ -44,26 +44,6 @@ cfg = {
     "n_kv_groups": 8, "rope_base": 1000000.0, "dtype": 'bfloat16', #torch.bfloat16,
 }
 
-
-'''
-def manual_vmap(fn, *args):
-    dim1 = args[0].shape[0]
-    outputs = []
-    for i in range(dim1):
-        inputs_i = [arg[i] for arg in args]  # Grab the i-th slice from each arg
-        out = fn(*inputs_i)
-        outputs.append(out)
-
-    return jnp.stack(outputs)
-
-def manual_vmap(att_head, queries, keys_expanded, values_expanded, pre, position_offset):    
-    xr = []
-    for query, key, value in zip(queries, keys_expanded, values_expanded):
-        x = att_head(query, key, value, pre, position_offset)
-        xr.append(x)
-    return jnp.stack(xr)
-'''
-
 def manual_vmap(att_head, queries, keys_expanded, values_expanded, pre, position_offset):
     def bodyfn(carry, x):
         queries, keys_expanded, values_expanded = x
@@ -71,8 +51,6 @@ def manual_vmap(att_head, queries, keys_expanded, values_expanded, pre, position
         return carry, x
     carry, xr = jax.lax.scan(bodyfn, None, xs=(queries, keys_expanded, values_expanded), unroll=unroll)
     return xr
-
-
 
 #@partial(jax.jit, static_argnums=[3])
 def att_head_coder_causal(queries, keys, values, pre, position_offset, tile_size=2*1024):
@@ -195,11 +173,12 @@ def att_head_orig(queries, keys_expanded, values_expanded, pre, position_offset)
     context = jnp.matmul(attn_weights, values_expanded)
     return context
 
+
 #partial(jax.jit, static_argnums=[])
-def att2(queries, keys_expanded, values_expanded, out_proj, pre, position_offset):
+def att2(queries, keys_expanded, values_expanded, out_proj, pre, position_offset, tiled=True):
     #set_trace()
     run = True
-    tiled = True
+    #tiled = True
 
     if run:
         if tiled == True:
@@ -222,6 +201,11 @@ def grouped_query_attention_forward_kv(num_heads, num_kv_groups, head_dim, param
     cos, sin = compute_rope_params(cfg["head_dim"], cfg["rope_base"], cfg["context_length"])
     seq, d_in = x.shape
     group_size = num_heads // num_kv_groups
+
+    if not pre:
+        pass
+        #set_trace()
+        #query_W = jax.lax.dynamic_slice(params["W_query"], (0, position_offset,0), (16,1,128))
     
     queries = jnp.einsum('sd,dh->sh', x, params["W_query"]).reshape(seq, num_heads, head_dim).transpose(1,0,2)
     keys = jnp.einsum('sd,dh->sh', x, params["W_key"]).reshape(seq, num_kv_groups, head_dim).transpose(1,0,2)
@@ -239,16 +223,28 @@ def grouped_query_attention_forward_kv(num_heads, num_kv_groups, head_dim, param
     if pre:
         kv_cache["keys"] = kv_cache["keys"].at[0,:,:keys.shape[1]].set(keys)
         kv_cache["values"] = kv_cache["values"].at[0,:,:values.shape[1]].set(values)
-        #set_trace()
         position_offset_new = keys.shape[1]
         #keys = kv_cache['keys'][0]
         #values = kv_cache['values'][0]
     else:
         kv_cache["keys"] = kv_cache["keys"].at[0,:,position_offset].set(keys[:,0])
         kv_cache["values"] = kv_cache["values"].at[0,:,position_offset].set(values[:,0])
+
+        # this still atm runs the whole seqlen of the kv cache
+        # batch, heads, seqlen, embdim
         keys = kv_cache['keys'][0]
         values = kv_cache['values'][0]
+        keys2 = keys
+        values2 = values
 
+        #set_trace()
+        #keys = jax.lax.dynamic_slice(keys, [0, 0, 0], (keys.shape[0], 1024, keys.shape[2]))
+        #values = jax.lax.dynamic_slice(values, [0, 0, 0], (values.shape[0], 1024, values.shape[2]))
+
+        keys = keys[:,:1024]
+        values = values[:,:1024]
+
+        #jax.debug.breakpoint()
         position_offset_new = position_offset + 1
         
     new_cache = kv_cache
@@ -261,7 +257,7 @@ def grouped_query_attention_forward_kv(num_heads, num_kv_groups, head_dim, param
         # only compute on the non cached values
         qp = jax.lax.dynamic_slice(queries, (0, position_offset,0), (16,1,128))
         #qp = queries
-        output = att2(qp, keys_expanded, values_expanded, params['out_proj'], pre, position_offset)
+        output = att2(qp, keys_expanded, values_expanded, params['out_proj'], pre, position_offset, tiled=False)
 
     return output[None], new_cache, position_offset_new
 
@@ -381,7 +377,7 @@ def gen(params, logits, kv_cache, position_offset,  max_new_tokens):
     [params, logits, kv_cache, position_offset], seq = jax.lax.scan(
             decode_step, 
             init=[params, logits, kv_cache, position_offset], length=max_new_tokens,
-            unroll=False, #20,
+            unroll=10, #20,
             )
     return [logits, kv_cache, position_offset], seq
 
@@ -389,7 +385,7 @@ def gen2(f, logits, kv_cache, position_offset,  max_new_tokens):
     [logits, kv_cache, position_offset], seq = jax.lax.scan(
             f, 
             init=[logits, kv_cache, position_offset], length=max_new_tokens,
-            unroll=False, #20,
+            unroll=10, #20,
             )
     return [logits, kv_cache, position_offset], seq
 
@@ -480,7 +476,7 @@ def generate_kv_optimized(model, idx, max_new_tokens, context_size, temperature=
         gc.collect()
 
         stt = time.time()
-        profile = False
+        profile = True
         if profile:
             jax.profiler.start_trace("/tmp/jax-trace1")#, profiler_options=options)
 
