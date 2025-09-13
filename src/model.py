@@ -428,7 +428,7 @@ def decode_step(carry,x):#logits, kv_cache, position_offset, cur_ids):
     next_token = jnp.argmax(next_token_logits, axis=-1)
     
     # Process next tokens for entire batch
-    logits, kv_cache, position_offset = qwen3_forward_kv2(params, next_token[:, None], cfg, kv_cache, position_offset)
+    logits, kv_cache, position_offset = qwen3_forward_kv(params, next_token[:, None], cfg, kv_cache, position_offset)
     return [params, logits, kv_cache, position_offset ], next_token
 
 #@jax.jit
@@ -510,8 +510,7 @@ def generate_kv_optimized(model, idx, max_new_tokens, context_size, temperature=
     #logits, kv_cache, position_offset, cur_ids = gen(f, logits, kv_cache, position_offset, cur_ids2, max_new_tokens)
     #set_trace()
     #traced = jax.jit(gen, static_argnums=[3,4]).trace(params, logits, kv_cache, int(position_offset), max_new_tokens)
-    #traced = jax.jit(gen, static_argnums=[4], donate_argnums=[2]).trace(params, logits, kv_cache, int(position_offset), max_new_tokens)
-    traced = jax.jit(gen, static_argnums=[4], donate_argnums=[2]).trace(params, logits, kv_cache, int(position_offset), max_new_tokens)
+    traced = jax.jit(gen, static_argnums=[4], donate_argnums=[]).trace(params, logits, kv_cache, int(position_offset), max_new_tokens)
     lowered = traced.lower()
     compiled_gen = lowered.compile()
     print('compiled')
