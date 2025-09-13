@@ -329,26 +329,96 @@ def qwen3_forward_kv(params, x, cfg, kv_cache, position_offset, pre=False):
     
     return logits, new_cache, position_offset_new
 
+
+
+# https://docs.liesel-project.org/en/v0.1.4/_modules/liesel/goose/pytree.html#stack_leaves
+# source from: https://github.com/jax-ml/jax/discussions/16882#discussioncomment-6638501
+def stack_leaves(pytrees, axis: int=0):
+    '''
+    Stack the leaves of one or more PyTrees along a new axis.
+
+    Args:
+        pytrees: One or more PyTrees.
+        axis (int, optional): The axis along which the arrays will be stacked. Default is 0.
+
+    Returns:
+        The PyTree with its leaves stacked along the new axis.
+    '''
+    return jax.tree_util.tree_map(lambda *xs: jnp.stack(xs, axis=axis), *pytrees)
+
+# https://gist.github.com/willwhitney/dd89cac6a5b771ccff18b06b33372c75?permalink_comment_id=4634557#gistcomment-4634557
+def unstack_leaves(pytrees):
+    '''
+    Unstack the leaves of a PyTree.
+
+    Args:
+        pytrees: A PyTree.
+
+    Returns:
+        A list of PyTrees, where each PyTree has the same structure as the input PyTree, but each leaf contains only one part of the original leaf.
+    '''
+    leaves, treedef = jax.tree_util.tree_flatten(pytrees)
+    return [treedef.unflatten(leaf) for leaf in zip(*leaves, strict=True)]
+
+
 def qwen3_forward_kv2(params, x, cfg, kv_cache, position_offset, pre=False):
     x = params["tok_emb"][x]
-    set_trace()
-    keys = kv_cache["keys"]
-    vals = kv_cache["values"]
+    # shape b, s, li, maxseq, head
+    keys = kv_cache["keys"][0]
+    vals = kv_cache["values"][0]
+    blocks = params['trf_blocks']
 
-    def scan_fn(carry, block_params):
-        kv_cache, position_offset = carry
-        layer_cache = {"keys": kv_cache["keys"][:,i], "values": kv_cache["values"][:,i]}
+    if pre:
+        # unbatch
+        x = x[0]
+    else:
+        # unbatch and unseq
+        x = x[0,0]
+
+    init = (x,)
+    layers = 28
+    xs = (stack_leaves(blocks), keys, vals)
+
+    def scan_fn(carry, params):
+        x = carry[0]
+        set_trace()
+        block_params, keys, vals = params
+        keys = keys[None]
+        vals = vals[None]
+
+        layer_cache = {"keys": keys, "values": vals}
         x, updated_cache, position_offset_new = transformer_block_forward_kv(block_params, layer_cache, position_offset, x, pre=pre)
-        kv_cache['keys'] = kv_cache['keys'].at[:,i].set(updated_cache['keys'])
-        kv_cache['values'] = kv_cache['values'].at[:,i].set(updated_cache['values'])
-        return (kv_cache, position_offset_new), None
+        keys2 = updated_cache['keys']
+        vals2 = updated_cache['values']
+
+        if pre:
+            x = x[0]
+        else:
+            x = x[0,0]
+
+        return carry, (keys2, vals2)
     
-    kv_cache, position_offset_new = jax.lax.scan(scan_fn, init=(x), xs=[kv_cache, params["trf_blocks"]])
+    _, (keys, vals) = jax.lax.scan(scan_fn, init=init, xs=xs, length=len(blocks), unroll=False)
+
+    set_trace()
+    keys = keys[:,0][None]
+    vals = vals[:,0][None]
+    kv_cache['keys'] = keys
+    kv_cache['values'] = vals
     
     x = rmsnorm_forward(params["final_norm"], x)
-    logits = jnp.matmul(x[-1,-1:], params["out_head"])[None, :]
+
+    # cant do logits on prefill because it would be of shape [ctxlen, vocab] <- too big
+    if pre:
+        logits = jnp.matmul(x[-1:], params["out_head"])[None, :]
+    else:
+        logits = jnp.matmul(x[None], params["out_head"])[None, :]
     
-    return logits, kv_cache, position_offset_new
+    if pre:
+        return logits, kv_cache, x.shape[0] + 1
+    else:
+        return logits, kv_cache, position_offset + 1
+
 
 #scan(step, init=[params, cfg, kv_cache])(next_token, position_offset)
 def decode_step(carry,x):#logits, kv_cache, position_offset, cur_ids):
@@ -358,7 +428,7 @@ def decode_step(carry,x):#logits, kv_cache, position_offset, cur_ids):
     next_token = jnp.argmax(next_token_logits, axis=-1)
     
     # Process next tokens for entire batch
-    logits, kv_cache, position_offset = qwen3_forward_kv(params, next_token[:, None], cfg, kv_cache, position_offset)
+    logits, kv_cache, position_offset = qwen3_forward_kv2(params, next_token[:, None], cfg, kv_cache, position_offset)
     return [params, logits, kv_cache, position_offset ], next_token
 
 #@jax.jit
@@ -426,7 +496,7 @@ def generate_kv_optimized(model, idx, max_new_tokens, context_size, temperature=
 
     print('starting prefill')
     logits, kv_cache, position_offset = compiled_pre(params, cur_ids, cfg, kv_cache)
-    block([logits, kv_cache, position_offset])
+    block([logits, position_offset])
 
     if profile:
         jax.profiler.stop_trace()
@@ -440,7 +510,8 @@ def generate_kv_optimized(model, idx, max_new_tokens, context_size, temperature=
     #logits, kv_cache, position_offset, cur_ids = gen(f, logits, kv_cache, position_offset, cur_ids2, max_new_tokens)
     #set_trace()
     #traced = jax.jit(gen, static_argnums=[3,4]).trace(params, logits, kv_cache, int(position_offset), max_new_tokens)
-    traced = jax.jit(gen, static_argnums=[4]).trace(params, logits, kv_cache, int(position_offset), max_new_tokens)
+    #traced = jax.jit(gen, static_argnums=[4], donate_argnums=[2]).trace(params, logits, kv_cache, int(position_offset), max_new_tokens)
+    traced = jax.jit(gen, static_argnums=[4], donate_argnums=[2]).trace(params, logits, kv_cache, int(position_offset), max_new_tokens)
     lowered = traced.lower()
     compiled_gen = lowered.compile()
     print('compiled')
@@ -448,12 +519,14 @@ def generate_kv_optimized(model, idx, max_new_tokens, context_size, temperature=
     use_lax = True
     if use_lax:
         # warmup
-        cur_ids3 = jnp.array([[1999]*26])
-        #[logits1, kv_cache1, position_offset1], seq = compiled_gen(params, logits, kv_cache)#, int(position_offset), max_new_tokens)
-        [logits1, kv_cache1, position_offset1], seq = compiled_gen(params, logits, kv_cache, int(position_offset))#, max_new_tokens)
-        block([logits1, kv_cache1, position_offset1, seq])
-        del logits1, kv_cache1, position_offset1
-        gc.collect()
+        warmup = False
+        if warmup:
+            cur_ids3 = jnp.array([[1999]*26])
+            #[logits1, kv_cache1, position_offset1], seq = compiled_gen(params, logits, kv_cache)#, int(position_offset), max_new_tokens)
+            [logits1, kv_cache1, position_offset1], seq = compiled_gen(params, logits, kv_cache, int(position_offset))#, max_new_tokens)
+            block([logits1, position_offset1, seq])
+            del logits1, kv_cache1, position_offset1
+            gc.collect()
 
         stt = time.time()
         profile = False
@@ -471,7 +544,8 @@ def generate_kv_optimized(model, idx, max_new_tokens, context_size, temperature=
         cur_ids3 = jnp.array([[1999]*26])
         #[logits1, kv_cache1, position_offset1], seq = compiled_gen(params, logits, kv_cache)#, int(position_offset), max_new_tokens)
         [logits1, kv_cache1, position_offset1], seq = compiled_gen(params, logits, kv_cache, int(position_offset))#, max_new_tokens)
-        block([logits1, kv_cache1, position_offset1, seq])
+        block([logits1, position_offset1, seq])
+
         ft = time.perf_counter()
         tt = ft - stt
         toks = 2*max_new_tokens
