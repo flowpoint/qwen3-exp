@@ -175,6 +175,15 @@ def att_head_orig(queries, keys_expanded, values_expanded, pre, position_offset)
     return context
 
 
+def gen_att(queries, keys_expanded, values_expanded, position_offset):
+    attn_scores = jnp.matmul(queries, keys_expanded.transpose(1,0)) / jnp.sqrt(cfg['head_dim'])
+    mask = np.arange(keys_expanded.shape[0]) > position_offset + 1
+    attn_scores = jnp.where(mask, -jnp.float_('inf'), attn_scores)
+    attn_weights = jax.nn.softmax(attn_scores, axis=-1)
+    context = jnp.matmul(attn_weights, values_expanded)
+    return context
+
+
 #partial(jax.jit, static_argnums=[])
 def att2(queries, keys_expanded, values_expanded, out_proj, pre, position_offset, tiled=True):
     #set_trace()
@@ -269,7 +278,12 @@ def grouped_query_attention_forward_kv(num_heads, num_kv_groups, head_dim, param
         # only compute on the non cached values
         qp = jax.lax.dynamic_slice(queries, (0, position_offset,0), (16,1,128))
         #qp = queries
-        output = att2(qp, keys_expanded, values_expanded, params['out_proj'], pre, position_offset, tiled=False)
+        #output = att2(qp, keys_expanded, values_expanded, params['out_proj'], pre, position_offset, tiled=False)
+        #set_trace()
+        #output = jax.vmap(gen_att)(qp, keys_expanded, values_expanded, jnp.tile(params['out_proj'], [qp.shape[0],1]), jnp.ones(qp.shape[0])*position_offset)
+        context = jax.vmap(gen_att, (0,0,0,None))(qp, keys_expanded, values_expanded, position_offset)
+        context = context.transpose(1,0,2).reshape(qp.shape[1], cfg['n_heads'] * cfg['head_dim'])
+        output = jnp.einsum('sh,hd->sd', context, params['out_proj'])
 
     return output[None], new_cache, position_offset_new
 
