@@ -17,6 +17,9 @@ from functools import partial, reduce
 
 dtype = jnp.float32
 
+def rms2(norm1, x):
+    return jax.vmap(lambda y: rmsnorm_forward(norm1, y))(x)
+
 def feedforward_forward(params, x):
     gate = jax.nn.silu(jnp.einsum('bse,eh->bsh', x, params["gate_proj"]))
     up = jnp.einsum('bse,eh->bsh', x, params["up_proj"])

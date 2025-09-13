@@ -13,6 +13,7 @@ from pdb import set_trace
 from timeit import timeit
 import time
 import gc
+import operator
 
 from math import ceil
 
@@ -49,7 +50,7 @@ def manual_vmap(att_head, queries, keys_expanded, values_expanded, pre, position
         queries, keys_expanded, values_expanded = x
         x = att_head(queries, keys_expanded, values_expanded, pre, position_offset)
         return carry, x
-    carry, xr = jax.lax.scan(bodyfn, None, xs=(queries, keys_expanded, values_expanded), unroll=unroll)
+    carry, xr = jax.lax.scan(bodyfn, None, xs=(queries, keys_expanded, values_expanded), unroll=False)
     return xr
 
 #@partial(jax.jit, static_argnums=[3])
@@ -142,9 +143,9 @@ def att_head_coder_causal(queries, keys, values, pre, position_offset, tile_size
     scan_inputs = (ks, vs, start_indices)
 
     if pre:
-        (Fn, Ln, _), _ = jax.lax.scan(causal_bodyfn_pre, init_pre, scan_inputs, unroll=4)
+        (Fn, Ln, _), _ = jax.lax.scan(causal_bodyfn_pre, init_pre, scan_inputs, unroll=False)
     else:
-        (Fn, Ln, _, _), _ = jax.lax.scan(causal_bodyfn, init, scan_inputs, unroll=4)
+        (Fn, Ln, _, _), _ = jax.lax.scan(causal_bodyfn, init, scan_inputs, unroll=False)
 
     # no nans allowed
     # cant assert #assert jnp.all(Ln != 0.)
@@ -178,7 +179,6 @@ def att_head_orig(queries, keys_expanded, values_expanded, pre, position_offset)
 def att2(queries, keys_expanded, values_expanded, out_proj, pre, position_offset, tiled=True):
     #set_trace()
     run = True
-    #tiled = True
 
     if run:
         if tiled == True:
@@ -206,27 +206,36 @@ def grouped_query_attention_forward_kv(num_heads, num_kv_groups, head_dim, param
         pass
         #set_trace()
         #query_W = jax.lax.dynamic_slice(params["W_query"], (0, position_offset,0), (16,1,128))
+
+    #bp()
     
     queries = jnp.einsum('sd,dh->sh', x, params["W_query"]).reshape(seq, num_heads, head_dim).transpose(1,0,2)
     keys = jnp.einsum('sd,dh->sh', x, params["W_key"]).reshape(seq, num_kv_groups, head_dim).transpose(1,0,2)
-    values = jnp.einsum('sd,dh->sh', x, params["W_value"]).reshape(seq, num_kv_groups, head_dim).transpose(1,0,2)
-    keys = keys.astype(dtype)
-    values = values.astype(dtype)
 
     if qk_norm and "q_norm" in params and "k_norm" in params:
         queries = apply_qk_norm(queries, params["q_norm"])
         keys = apply_qk_norm(keys, params["k_norm"])
 
-    queries = apply_rope_with_offset(queries[None], cos, sin, position_offset)[0]
-    keys = apply_rope_with_offset(keys[None], cos, sin, position_offset)[0]
     
     if pre:
+        queries = apply_rope_with_offset(queries[None], cos, sin, position_offset)[0]
+        keys = apply_rope_with_offset(keys[None], cos, sin, position_offset)[0]
+        values = jnp.einsum('sd,dh->sh', x, params["W_value"]).reshape(seq, num_kv_groups, head_dim).transpose(1,0,2)
+
         kv_cache["keys"] = kv_cache["keys"].at[0,:,:keys.shape[1]].set(keys)
         kv_cache["values"] = kv_cache["values"].at[0,:,:values.shape[1]].set(values)
         position_offset_new = keys.shape[1]
         #keys = kv_cache['keys'][0]
         #values = kv_cache['values'][0]
     else:
+        queries = apply_rope_with_offset(queries[None], cos, sin, position_offset)[0]
+        keys = apply_rope_with_offset(keys[None, :, 0:1], cos, sin, position_offset)[0, :, 0:1]
+        bp()
+        values = jnp.einsum('sd,dh->sh', x, params["W_value"]).reshape(seq, num_kv_groups, head_dim).transpose(1,0,2)[:, 0:1]
+
+        #keys2 = jnp.concat([kv_cache['keys'][0,:,:26], keys[:,0]])[0]
+        #values2 = jnp.concat([kv_cache['values'][0,:,:26], values[:,0]])[0]
+
         kv_cache["keys"] = kv_cache["keys"].at[0,:,position_offset].set(keys[:,0])
         kv_cache["values"] = kv_cache["values"].at[0,:,position_offset].set(values[:,0])
 
@@ -234,17 +243,15 @@ def grouped_query_attention_forward_kv(num_heads, num_kv_groups, head_dim, param
         # batch, heads, seqlen, embdim
         keys = kv_cache['keys'][0]
         values = kv_cache['values'][0]
-        keys2 = keys
-        values2 = values
 
         #set_trace()
         #keys = jax.lax.dynamic_slice(keys, [0, 0, 0], (keys.shape[0], 1024, keys.shape[2]))
         #values = jax.lax.dynamic_slice(values, [0, 0, 0], (values.shape[0], 1024, values.shape[2]))
 
+        # hardcoding the max amount of new tokens, limits prefill too for now
         keys = keys[:,:1024]
         values = values[:,:1024]
 
-        #jax.debug.breakpoint()
         position_offset_new = position_offset + 1
         
     new_cache = kv_cache
@@ -261,8 +268,6 @@ def grouped_query_attention_forward_kv(num_heads, num_kv_groups, head_dim, param
 
     return output[None], new_cache, position_offset_new
 
-def rms2(norm1, x):
-    return jax.vmap(lambda y: rmsnorm_forward(norm1, y))(x)
 
 #@partial(jax.jit, static_argnums=[4], donate_argnums=[1])
 def transformer_block_forward_kv(params, kv_cache, position_offset, x, pre=False):
@@ -275,50 +280,6 @@ def transformer_block_forward_kv(params, kv_cache, position_offset, x, pre=False
     x = feedforward_forward(params["ff"], x)
     return x + shortcut, new_cache, position_offset
 
-
-
-def get_logits_old(cfg, x, params):
-    logits_chunks = []
-    seq_chunk_size = 1024
-    for chunk_start in range(0, cfg["context_length"], seq_chunk_size):
-        chunk_end = min(chunk_start + seq_chunk_size, cfg["context_length"])
-        x_chunk = x[:, chunk_start:chunk_end]
-        print(x_chunk.shape)
-        print(params['out_head'].shape)
-        logits_chunk = jnp.einsum('bse,ev->bsv', x_chunk, params["out_head"])
-        logits_chunks.append(logits_chunk)
-    
-    logits = jnp.concatenate(logits_chunks, axis=1)
-    return logits
-
-def get_logits(cfg, x, params, vocab_chunk_size=128):
-    """Chunked version of get_logits across the vocab/embedding dimension"""
-    logits_chunks = []
-    seq_chunk_size = 1
-    
-    for chunk_start in range(0, cfg["context_length"], seq_chunk_size):
-        chunk_end = min(chunk_start + seq_chunk_size, cfg["context_length"])
-        x_chunk = x[:, chunk_start:chunk_end]
-        
-        vocab_chunks = []
-        vocab_size = params['out_head'].shape[0]
-        
-        for vocab_chunk_start in range(0, vocab_size, vocab_chunk_size):
-            vocab_chunk_end = min(vocab_chunk_start + vocab_chunk_size, vocab_size)
-            #print('--')
-            #print(params['out_head'].shape)
-            out_head_chunk = params["out_head"][:, vocab_chunk_start:vocab_chunk_end]
-            #print(x_chunk.shape)
-            #print(out_head_chunk.shape)
-            logits_chunk = jnp.einsum('bse,ev->bsv', x_chunk, out_head_chunk)
-            vocab_chunks.append(logits_chunk)
-        
-        # Concatenate vocab chunks for this sequence chunk
-        logits_seq_chunk = jnp.concatenate(vocab_chunks, axis=2)
-        logits_chunks.append(logits_seq_chunk)
-    
-    logits = jnp.concatenate(logits_chunks, axis=1)
-    return logits
 
 #@partial(jax.jit, static_argnums=[5], donate_argnums=[3])
 def qwen3_forward_kv(params, x, cfg, kv_cache, position_offset, pre=False):
@@ -339,28 +300,6 @@ def qwen3_forward_kv(params, x, cfg, kv_cache, position_offset, pre=False):
     return logits, new_cache, position_offset_new
 
 
-def steptop(params, cfg):
-    #@jax.jit
-    def step(args,_):#logits, kv_cache, position_offset, cur_ids):
-        logits, kv_cache, position_offset = args
-
-        next_token_logits = logits[:, -1, :]
-        next_token = jnp.argmax(next_token_logits, axis=-1)
-
-        '''
-        if eos_id is not None and jnp.any(next_token == eos_id):
-            break
-        '''
-        
-        #cur_ids = jnp.concatenate([cur_ids, next_token[:, None]], axis=1)
-        
-        # Process next tokens for entire batch
-        logits, kv_cache, position_offset = qwen3_forward_kv(params, next_token[:, None], cfg, kv_cache, position_offset)
-        return [logits, kv_cache, position_offset ], next_token
-        #return [logits, kv_cache, position_offset, cur_ids], None
-    return step
-
-
 #scan(step, init=[params, cfg, kv_cache])(next_token, position_offset)
 def decode_step(carry,x):#logits, kv_cache, position_offset, cur_ids):
     params, logits, kv_cache, position_offset = carry
@@ -377,15 +316,7 @@ def gen(params, logits, kv_cache, position_offset,  max_new_tokens):
     [params, logits, kv_cache, position_offset], seq = jax.lax.scan(
             decode_step, 
             init=[params, logits, kv_cache, position_offset], length=max_new_tokens,
-            unroll=10, #20,
-            )
-    return [logits, kv_cache, position_offset], seq
-
-def gen2(f, logits, kv_cache, position_offset,  max_new_tokens):
-    [logits, kv_cache, position_offset], seq = jax.lax.scan(
-            f, 
-            init=[logits, kv_cache, position_offset], length=max_new_tokens,
-            unroll=10, #20,
+            unroll=False, #20,
             )
     return [logits, kv_cache, position_offset], seq
 
@@ -404,7 +335,6 @@ def block(args):
 def generate_kv_optimized(model, idx, max_new_tokens, context_size, temperature=0.7, top_k=50, eos_id=None):
     params, cfg = model["params"], model["cfg"]
     cfg.pop('dtype')
-    import operator
     
     # Keep input on device
     cur_ids = jnp.array([idx])
@@ -451,12 +381,11 @@ def generate_kv_optimized(model, idx, max_new_tokens, context_size, temperature=
         jax.profiler.stop_trace()
     ft = time.perf_counter()
     tt = ft - stt
-    toks = 2*max_new_tokens
+    toks = cur_ids.shape[-1]
     print(f"took: {tt} for {cur_ids.shape[-1]} at {toks/tt} toks/sec")
     print('prefilled')
 
-    cur_ids2 = jnp.array([[999]*26])
-
+    #cur_ids2 = jnp.array([[999]*26])
     #logits, kv_cache, position_offset, cur_ids = gen(f, logits, kv_cache, position_offset, cur_ids2, max_new_tokens)
     #set_trace()
     #traced = jax.jit(gen, static_argnums=[3,4]).trace(params, logits, kv_cache, int(position_offset), max_new_tokens)
@@ -476,7 +405,7 @@ def generate_kv_optimized(model, idx, max_new_tokens, context_size, temperature=
         gc.collect()
 
         stt = time.time()
-        profile = True
+        profile = False
         if profile:
             jax.profiler.start_trace("/tmp/jax-trace1")#, profiler_options=options)
 
