@@ -230,8 +230,10 @@ def grouped_query_attention_forward_kv(num_heads, num_kv_groups, head_dim, param
     else:
         queries = apply_rope_with_offset(queries[None], cos, sin, position_offset)[0]
         keys = apply_rope_with_offset(keys[None, :, 0:1], cos, sin, position_offset)[0, :, 0:1]
-        bp()
-        values = jnp.einsum('sd,dh->sh', x, params["W_value"]).reshape(seq, num_kv_groups, head_dim).transpose(1,0,2)[:, 0:1]
+        #values = jnp.einsum('sd,dh->sh', x, params["W_value"]).reshape(seq, num_kv_groups, head_dim).transpose(1,0,2)[:, 0:1]
+        # during inference seqlen (new prefill tokens) is 1
+        values = jnp.einsum('sd,dh->sh', x, params["W_value"])[0].reshape(num_kv_groups, 1, head_dim)
+        #set_trace()
 
         #keys2 = jnp.concat([kv_cache['keys'][0,:,:26], keys[:,0]])[0]
         #values2 = jnp.concat([kv_cache['values'][0,:,:26], values[:,0]])[0]
