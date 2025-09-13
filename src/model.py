@@ -277,10 +277,6 @@ def grouped_query_attention_forward_kv(num_heads, num_kv_groups, head_dim, param
     else:
         # only compute on the non cached values
         qp = jax.lax.dynamic_slice(queries, (0, position_offset,0), (16,1,128))
-        #qp = queries
-        #output = att2(qp, keys_expanded, values_expanded, params['out_proj'], pre, position_offset, tiled=False)
-        #set_trace()
-        #output = jax.vmap(gen_att)(qp, keys_expanded, values_expanded, jnp.tile(params['out_proj'], [qp.shape[0],1]), jnp.ones(qp.shape[0])*position_offset)
         context = jax.vmap(gen_att, (0,0,0,None))(qp, keys_expanded, values_expanded, position_offset)
         context = context.transpose(1,0,2).reshape(qp.shape[1], cfg['n_heads'] * cfg['head_dim'])
         output = jnp.einsum('sh,hd->sd', context, params['out_proj'])
@@ -338,7 +334,7 @@ def gen(params, logits, kv_cache, position_offset,  max_new_tokens):
     [params, logits, kv_cache, position_offset], seq = jax.lax.scan(
             decode_step, 
             init=[params, logits, kv_cache, position_offset], length=max_new_tokens,
-            unroll=False, #20,
+            unroll=5, #20, # unroll = 2 crashes with internal error, unroll = 3 produces different result, false, 4, 5 are fine
             )
     return [logits, kv_cache, position_offset], seq
 
