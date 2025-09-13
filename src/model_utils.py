@@ -54,8 +54,8 @@ def apply_rope_with_offset(x, cos, sin, position_offset=0):
     return ((x * cos_slice) + (rotated * sin_slice)).astype(dtype)
 
 def apply_qk_norm(x, norm_params):
-    b, h, s, d = x.shape
-    x_reshaped = x.reshape(b * h * s, d)
+    h, s, d = x.shape
+    x_reshaped = x.reshape(h * s, d)
     x_normed = rmsnorm_forward(norm_params, x_reshaped)
-    return x_normed.reshape(b, h, s, d)
+    return x_normed.reshape(h, s, d)
 
