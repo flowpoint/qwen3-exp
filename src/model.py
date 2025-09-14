@@ -45,15 +45,7 @@ cfg = {
     "n_kv_groups": 8, "rope_base": 1000000.0, "dtype": 'bfloat16', #torch.bfloat16,
 }
 
-def manual_vmap(att_head, queries, keys_expanded, values_expanded, pre, position_offset):
-    def bodyfn(carry, x):
-        queries, keys_expanded, values_expanded = x
-        x = att_head(queries, keys_expanded, values_expanded, pre, position_offset)
-        return carry, x
-    carry, xr = jax.lax.scan(bodyfn, None, xs=(queries, keys_expanded, values_expanded), unroll=False)
-    return xr
-
-def att_head_coder_causal_pre(queries, keys, values, pre, position_offset, tile_size=2*1024):
+def att_head_tiled_pre(queries, keys, values, pre, position_offset, tile_size=2*1024):
     dtype_l = dtype
     queries = queries.astype(dtype_l)
     keys = keys.astype(dtype_l)
@@ -115,24 +107,7 @@ def att_head_coder_causal_pre(queries, keys, values, pre, position_offset, tile_
     #return jnp.where(L != 0, F / L, 0.0)
 
 
-def att_head_orig(queries, keys_expanded, values_expanded, pre, position_offset):
-    attn_scores = jnp.matmul(queries, keys_expanded.transpose(1,0)) / jnp.sqrt(cfg['head_dim'])
-
-    if pre:
-        q_len, k_len = queries.shape[0], keys_expanded.shape[0]
-        causal_mask = jnp.triu(jnp.ones((q_len, k_len)), k=1)
-        attn_scores = jnp.where(causal_mask, -jnp.inf, attn_scores)
-
-    else:
-        mask = np.arange(keys_expanded.shape[0]) > position_offset + 1
-        attn_scores = jnp.where(mask, jnp.finfo(dtype).min, attn_scores)
-
-    attn_weights = jax.nn.softmax(attn_scores, axis=-1)
-    context = jnp.matmul(attn_weights, values_expanded)
-    return context
-
-
-def gen_att(queries, keys_expanded, values_expanded, position_offset):
+def attention_head(queries, keys_expanded, values_expanded, position_offset):
     ''' simpler, untiled attention for generation '''
     attn_scores = jnp.matmul(queries, keys_expanded.transpose(1,0)) / jnp.sqrt(cfg['head_dim'])
     mask = np.arange(keys_expanded.shape[0]) > position_offset + 1
@@ -141,13 +116,18 @@ def gen_att(queries, keys_expanded, values_expanded, position_offset):
     context = jnp.matmul(attn_weights, values_expanded)
     return context
 
+def manual_vmap(att_head, queries, keys_expanded, values_expanded, pre, position_offset):
+    def bodyfn(carry, x):
+        queries, keys_expanded, values_expanded = x
+        x = att_head(queries, keys_expanded, values_expanded, pre, position_offset)
+        return carry, x
+    carry, xr = jax.lax.scan(bodyfn, None, xs=(queries, keys_expanded, values_expanded), unroll=False)
+    return xr
 
-def att2(queries, keys_expanded, values_expanded, out_proj, pre, position_offset, tiled=True):
+
+def attention_heads_prefill(queries, keys_expanded, values_expanded, out_proj, pre, position_offset, tiled=True):
     # use tiling iff prefill
-    if pre:
-        context = manual_vmap(att_head_coder_causal_pre, queries, keys_expanded, values_expanded, pre, position_offset)
-    else:
-        context = manual_vmap(att_head_orig, queries, keys_expanded, values_expanded, pre, position_offset)
+    context = manual_vmap(att_head_tiled_pre, queries, keys_expanded, values_expanded, pre, position_offset)
 
     context = context.transpose(1,0,2).reshape(queries.shape[1], cfg['n_heads'] * cfg['head_dim'])
     output = jnp.einsum('sh,hd->sd', context, out_proj)
@@ -221,11 +201,11 @@ def grouped_query_attention_forward_kv(num_heads, num_kv_groups, head_dim, param
     values_expanded = jnp.repeat(values, group_size, axis=0)
 
     if pre:
-        output = att2(queries, keys_expanded, values_expanded, params['out_proj'], pre, position_offset)
+        output = attention_heads_prefill(queries, keys_expanded, values_expanded, params['out_proj'], pre, position_offset)
     else:
         # only compute on the non cached values
         qp = jax.lax.dynamic_slice(queries, (0, position_offset,0), (16,1,128))
-        context = jax.vmap(gen_att, (0,0,0,None))(qp, keys_expanded, values_expanded, position_offset)
+        context = jax.vmap(attention_head, (0,0,0,None))(qp, keys_expanded, values_expanded, position_offset)
         context = context.transpose(1,0,2).reshape(qp.shape[1], cfg['n_heads'] * cfg['head_dim'])
         output = jnp.einsum('sh,hd->sd', context, params['out_proj'])
 
@@ -416,36 +396,5 @@ def generate_kv_optimized(model, idx, max_new_tokens, context_size, temperature=
             if eos_id is not None and cur_ids[-1] == eos_id:
                 break
         seq = jnp.stack(seq)
-
-    
-    '''
-    for i in tqdm(range(max_new_tokens), desc="Generating"):
-        next_token_logits = logits[:, -1, :]
-        
-        if top_k is not None and top_k > 0:
-            # Vectorized top_k for batch processing
-            top_k_logits, top_k_indices = jax.lax.top_k(next_token_logits, top_k)
-            mask = jnp.full_like(next_token_logits, -jnp.inf)
-            mask = jnp.take_along_axis(mask, top_k_indices, axis=-1)
-            mask = jnp.where(jnp.arange(mask.shape[-1])[None, :] < top_k, top_k_logits, -jnp.inf)
-            next_token_logits = jnp.full_like(next_token_logits, -jnp.inf)
-            next_token_logits = next_token_logits.at[jnp.arange(1)[:, None], top_k_indices].set(mask)
-        
-        if temperature > 0.0:
-            next_token_logits = next_token_logits / temperature
-            key, subkey = jax.random.split(key)
-            next_token = jax.random.categorical(subkey, next_token_logits, axis=-1)
-        else:
-            next_token = jnp.argmax(next_token_logits, axis=-1)
-        
-        # Check EOS for all sequences in batch - keep on device
-        if eos_id is not None and jnp.any(next_token == eos_id):
-            break
-        
-        cur_ids = jnp.concatenate([cur_ids, next_token[:, None]], axis=1)
-        
-        # Process next tokens for entire batch
-        logits, kv_cache, position_offset = qwen3_forward_kv(params, next_token[:, None], cfg, kv_cache, position_offset)
-        '''
     
     return jnp.stack(seq, axis=-1)
