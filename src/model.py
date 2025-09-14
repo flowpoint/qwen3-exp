@@ -1,3 +1,7 @@
+
+# SPDX-License-Identifier: Apache-2.0
+# author: flow
+
 import jax
 import jax.numpy as jnp
 import os
@@ -12,23 +16,30 @@ import time
 import gc
 import operator
 from math import ceil
+from functools import partial, reduce
+
+jax.clear_caches()
+
+# enforce explicit type casting
+strict = False
+if strict:
+    jax.config.update('jax_numpy_dtype_promotion', 'strict')
 
 bp = jax.debug.breakpoint
 
-from functools import partial, reduce
+#trigger_bug = True
+trigger_bug = True
 
 # set to speed up jit during experimentation
 unroll = True
-use_gpu = True
-if use_gpu and jax.default_backend() == 'gpu':
-    device =  jax.devices('gpu')[0]
-else:
-    device =  jax.devices('cpu')[0]
+device =  jax.devices('gpu')[0]
 
 # happens with both float16 and bfloat16
 # for float32 ooms first, idk if the bug persists
 #dtype = jax.dtypes.bfloat16
-dtype = jnp.float16
+dtype = jnp.bfloat16
+#dtype = jnp.float32
+dtype2 = jnp.float32
 
 #dtype = jnp.float32
 
@@ -44,35 +55,23 @@ cfg = {
 }
 
 
-dtype = jnp.float32
-
-def rms2(norm1, x):
-    return jax.vmap(lambda y: rmsnorm_forward(norm1, y))(x)
-
 def feedforward_forward(params, x):
     gate = jax.nn.silu(jnp.einsum('bse,eh->bsh', x, params["gate_proj"]))
     up = jnp.einsum('bse,eh->bsh', x, params["up_proj"])
     return jnp.einsum('bsh,he->bse', gate * up, params["down_proj"])
 
 def rmsnorm_forward(params, x, eps=1e-6):
-    orig_dtype = dtype
-    x = x.astype(dtype)
+    orig_dtype = x.dtype
+    x = x.astype(dtype2)
     variance = jnp.mean(x ** 2, axis=-1, keepdims=True)
     norm_x = x * jax.lax.rsqrt(variance + eps) * params["scale"]
-    return norm_x.astype(orig_dtype)
+    return norm_x.astype(dtype)
 
 def compute_rope_params(head_dim, theta_base=10000.0, context_length=4096):
     inv_freq = 1.0 / (theta_base ** (jnp.arange(0, head_dim, 2) / head_dim))
-    positions = jnp.arange(context_length)
+    positions = jnp.arange(context_length,dtype=dtype2)
     angles = jnp.concatenate([positions[:, None] * inv_freq[None, :]] * 2, axis=1)
     return jnp.cos(angles), jnp.sin(angles)
-
-def apply_rope(x, cos, sin):
-    seq_len = x.shape[2]
-    x1, x2 = x[..., :x.shape[-1]//2], x[..., x.shape[-1]//2:]
-    cos, sin = cos[:seq_len, :][None, None, :, :], sin[:seq_len, :][None, None, :, :]
-    rotated = jnp.concatenate([-x2, x1], axis=-1)
-    return ((x * cos) + (rotated * sin)).astype(dtype)
 
 def apply_rope_with_offset(x, cos, sin, position_offset=0):
     seq_len = x.shape[2]
@@ -83,7 +82,7 @@ def apply_rope_with_offset(x, cos, sin, position_offset=0):
     sin_slice = sin[positions, :][None, None, :, :]
     
     rotated = jnp.concatenate([-x2, x1], axis=-1)
-    return ((x * cos_slice) + (rotated * sin_slice)).astype(dtype)
+    return ((x * cos_slice) + (rotated * sin_slice)).astype(dtype2) # setting dtype2 here causes the bug
 
 def apply_qk_norm(x, norm_params):
     h, s, d = x.shape
@@ -183,12 +182,19 @@ def grouped_query_attention_forward_kv(num_heads, num_kv_groups, head_dim, param
     queries = apply_qk_norm(queries, params["q_norm"])
     keys = apply_qk_norm(keys, params["k_norm"])
 
-    queries = apply_rope_with_offset(queries[None], cos, sin, position_offset)[0]
-    keys = apply_rope_with_offset(keys[None, :, 0:1], cos, sin, position_offset)[0, :, 0]
+    # se
+    queries = apply_rope_with_offset(queries[None], cos, sin, position_offset)[0].astype(dtype)
+    keys = apply_rope_with_offset(keys[None, :, 0:1], cos, sin, position_offset)[0, :, 0].astype(dtype)
 
     values = jnp.einsum('d,dh->h', x, params["W_value"]).reshape(num_kv_groups, head_dim)
 
-    kv_cache["keys"] = kv_cache["keys"].at[0,:,position_offset].set(keys)
+    # assigning the float32 to the bf16 kv_cache
+    # thought it should downcast or type-error
+    if trigger_bug:
+        kv_cache["keys"] = kv_cache["keys"].at[0,:,position_offset].set(keys.astype(dtype2))
+    else:
+        kv_cache["keys"] = kv_cache["keys"].at[0,:,position_offset].set(keys.astype(dtype))
+
     kv_cache["values"] = kv_cache["values"].at[0,:,position_offset].set(values)
 
     # this still atm runs the whole seqlen of the kv cache
@@ -211,7 +217,7 @@ def grouped_query_attention_forward_kv(num_heads, num_kv_groups, head_dim, param
     qp = jax.lax.dynamic_slice(queries, (0, position_offset,0), (16,1,128))
     context = jax.vmap(gen_att, (0,0,0,None))(qp, keys_expanded, values_expanded, position_offset)
     context = context.transpose(1,0,2).reshape(qp.shape[1], cfg['n_heads'] * cfg['head_dim'])
-    output = jnp.einsum('sh,hd->sd', context, params['out_proj'])
+    output = jnp.einsum('sh,hd->sd', context, params['out_proj']).astype(dtype)
 
     return output, new_cache, position_offset_new
 
