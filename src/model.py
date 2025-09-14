@@ -118,24 +118,6 @@ def att_head_coder_causal_pre(queries, keys, values, pre, position_offset, tile_
     return (Fn / Ln).astype(dtype)
     #return jnp.where(L != 0, F / L, 0.0)
 
-
-def att_head_orig(queries, keys_expanded, values_expanded, pre, position_offset):
-    attn_scores = jnp.matmul(queries, keys_expanded.transpose(1,0)) / jnp.sqrt(cfg['head_dim'])
-
-    if pre:
-        q_len, k_len = queries.shape[0], keys_expanded.shape[0]
-        causal_mask = jnp.triu(jnp.ones((q_len, k_len)), k=1)
-        attn_scores = jnp.where(causal_mask, -jnp.inf, attn_scores)
-
-    else:
-        mask = np.arange(keys_expanded.shape[0]) > position_offset + 1
-        attn_scores = jnp.where(mask, -jnp.float_('inf'), attn_scores)
-
-    attn_weights = jax.nn.softmax(attn_scores, axis=-1)
-    context = jnp.matmul(attn_weights, values_expanded)
-    return context
-
-
 def gen_att(queries, keys_expanded, values_expanded, position_offset):
     ''' simpler, untiled attention for generation '''
     attn_scores = jnp.matmul(queries, keys_expanded.transpose(1,0)) / jnp.sqrt(cfg['head_dim'])
@@ -144,19 +126,6 @@ def gen_att(queries, keys_expanded, values_expanded, position_offset):
     attn_weights = jax.nn.softmax(attn_scores, axis=-1)
     context = jnp.matmul(attn_weights, values_expanded)
     return context
-
-
-def att2(queries, keys_expanded, values_expanded, out_proj, pre, position_offset, tiled=True):
-    # use tiling iff prefill
-    if pre:
-        context = manual_vmap(att_head_coder_causal_pre, queries, keys_expanded, values_expanded, pre, position_offset)
-    else:
-        context = manual_vmap(att_head_orig, queries, keys_expanded, values_expanded, pre, position_offset)
-
-    context = context.transpose(1,0,2).reshape(queries.shape[1], cfg['n_heads'] * cfg['head_dim'])
-    output = jnp.einsum('sh,hd->sd', context, out_proj)
-    return output
-    
 
 def grouped_query_attention_forward_kv(num_heads, num_kv_groups, head_dim, params, kv_cache, qk_norm, position_offset, x, pre=False):
     cos, sin = compute_rope_params(cfg["head_dim"], cfg["rope_base"], cfg["context_length"])
@@ -235,11 +204,11 @@ def qwen3_forward_kv(params, x, cfg, kv_cache, position_offset, pre=False):
     return logits, new_cache, position_offset_new
 
 
-def decode_step(carry,x):#logits, kv_cache, position_offset, cur_ids):
+def decode_step(carry,x):
     params, logits, kv_cache, position_offset = carry
 
-    #next_token_logits = logits[:, -1, :]
-    next_token = jnp.array([0]) #jnp.argmax(next_token_logits, axis=-1)
+    # stubbed out sampling
+    next_token = jnp.array([0]) 
     
     # Process next tokens for entire batch
     logits, kv_cache, position_offset = qwen3_forward_kv(params, next_token[:, None], cfg, kv_cache, position_offset)
@@ -257,12 +226,12 @@ def block(args):
         else:
             raise RuntimeError(a)
 
-def generate_kv_optimized(model, idx, max_new_tokens, context_size, temperature=0.7, top_k=50, eos_id=None):
+def generate_kv_optimized(rng_key, model, idx, max_new_tokens, context_size, temperature=0.7, top_k=50, eos_id=None):
     params, cfg = model["params"], model["cfg"]
     #cfg.pop('dtype')
     
     cur_ids = jnp.array([0])
-    key = jax.random.PRNGKey(42)
+    key = rng_key
     # Initialize KV cache for batch processing
     n_layers = cfg['n_layers']
     n_kv_groups = cfg['n_kv_groups']
@@ -284,7 +253,6 @@ def generate_kv_optimized(model, idx, max_new_tokens, context_size, temperature=
             # unroll 6 also is different like unroll 3
             )
     
-    return jnp.stack(seq, axis=-1)
 
 def init_qwen3_params(key, cfg):
     k_emb, k_blocks, k_final_norm, k_out = jax.random.split(key, 4)
@@ -336,7 +304,8 @@ if __name__ == "__main__":
     model = {"params": params, "cfg": cfg}
     
     # Generate with optimized function (batch_size=1 for single sequence)
-    output_token_ids = generate_kv_optimized(
+    generate_kv_optimized(
+        key,
         model=model, idx=input_token_ids, max_new_tokens=20,
         context_size=cfg["context_length"], top_k=1,
         temperature=0, eos_id=None
