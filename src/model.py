@@ -35,8 +35,8 @@ from model_utils import *
 dtype = jax.dtypes.bfloat16
 #dtype = jnp.float16
 #dtype = jnp.float32
-#cl = 40960
-cl = 8192
+cl = 40960
+#cl = 8192
 #cl = 1024
 
 cfg = {
@@ -133,81 +133,86 @@ def attention_heads_prefill(queries, keys_expanded, values_expanded, out_proj, p
     output = jnp.einsum('sh,hd->sd', context, out_proj)
     return output
     
-
-def grouped_query_attention_forward_kv(num_heads, num_kv_groups, head_dim, params, kv_cache, qk_norm, position_offset, x, pre=False):
+def grouped_query_attention_forward_kv_pre(num_heads, num_kv_groups, head_dim, params, kv_cache, qk_norm, position_offset, x, pre=True):
     cos, sin = compute_rope_params(cfg["head_dim"], cfg["rope_base"], cfg["context_length"])
     group_size = num_heads // num_kv_groups
-    if pre:
-        seq, d_in = x.shape
-    else:
-        d_in = x.shape
+    seq, d_in = x.shape
     
-    if pre:
-        queries = jnp.einsum('sd,dh->sh', x, params["W_query"]).reshape(seq, num_heads, head_dim).transpose(1,0,2)
-        keys = jnp.einsum('sd,dh->sh', x, params["W_key"]).reshape(seq, num_kv_groups, head_dim).transpose(1,0,2)
+    queries = jnp.einsum('sd,dh->sh', x, params["W_query"]).reshape(seq, num_heads, head_dim).transpose(1,0,2)
+    keys = jnp.einsum('sd,dh->sh', x, params["W_key"]).reshape(seq, num_kv_groups, head_dim).transpose(1,0,2)
 
-        if qk_norm and "q_norm" in params and "k_norm" in params:
-            queries = apply_qk_norm(queries, params["q_norm"])
-            keys = apply_qk_norm(keys, params["k_norm"])
+    if qk_norm and "q_norm" in params and "k_norm" in params:
+        queries = apply_qk_norm(queries, params["q_norm"])
+        keys = apply_qk_norm(keys, params["k_norm"])
 
 
-        queries = apply_rope_with_offset(queries[None], cos, sin, position_offset)[0]
-        keys = apply_rope_with_offset(keys[None], cos, sin, position_offset)[0]
-        values = jnp.einsum('sd,dh->sh', x, params["W_value"]).reshape(seq, num_kv_groups, head_dim).transpose(1,0,2)
+    queries = apply_rope_with_offset(queries[None], cos, sin, position_offset)[0]
+    keys = apply_rope_with_offset(keys[None], cos, sin, position_offset)[0]
+    values = jnp.einsum('sd,dh->sh', x, params["W_value"]).reshape(seq, num_kv_groups, head_dim).transpose(1,0,2)
 
-        kv_cache["keys"] = kv_cache["keys"].at[0,:,:keys.shape[1]].set(keys)
-        kv_cache["values"] = kv_cache["values"].at[0,:,:values.shape[1]].set(values)
-        position_offset_new = keys.shape[1]
-        #keys = kv_cache['keys'][0]
-        #values = kv_cache['values'][0]
-    else:
-        # during inference seqlen (new prefill tokens) is 1
-        queries = jnp.einsum('d,dh->h', x, params["W_query"]).reshape(num_heads, head_dim)[:, None]
-        keys = jnp.einsum('d,dh->h', x, params["W_key"]).reshape(num_kv_groups, head_dim)[:, None]
-
-        if qk_norm and "q_norm" in params and "k_norm" in params:
-            queries = apply_qk_norm(queries, params["q_norm"])
-            keys = apply_qk_norm(keys, params["k_norm"])
-
-        queries = apply_rope_with_offset(queries[None], cos, sin, position_offset)[0]
-        keys = apply_rope_with_offset(keys[None, :, 0:1], cos, sin, position_offset)[0, :, 0]
-
-        #values = jnp.einsum('sd,dh->sh', x, params["W_value"]).reshape(seq, num_kv_groups, head_dim).transpose(1,0,2)[:, 0:1]
-        values = jnp.einsum('d,dh->h', x, params["W_value"]).reshape(num_kv_groups, head_dim)
-
-        #keys2 = jnp.concat([kv_cache['keys'][0,:,:26], keys[:,0]])[0]
-        #values2 = jnp.concat([kv_cache['values'][0,:,:26], values[:,0]])[0]
-
-        kv_cache["keys"] = kv_cache["keys"].at[0,:,position_offset].set(keys)
-        kv_cache["values"] = kv_cache["values"].at[0,:,position_offset].set(values)
-
-        # this still atm runs the whole seqlen of the kv cache
-        # batch, heads, seqlen, embdim
-        keys = kv_cache['keys'][0]
-        values = kv_cache['values'][0]
-
-        #set_trace()
-        #keys = jax.lax.dynamic_slice(keys, [0, 0, 0], (keys.shape[0], 1024, keys.shape[2]))
-        #values = jax.lax.dynamic_slice(values, [0, 0, 0], (values.shape[0], 1024, values.shape[2]))
-
-        # hardcoding the max amount of new tokens, limits prefill too for now
-        #keys = keys[:,:1024]
-        #values = values[:,:1024]
-
-        position_offset_new = position_offset + 1
+    kv_cache["keys"] = kv_cache["keys"].at[0,:,:keys.shape[1]].set(keys)
+    kv_cache["values"] = kv_cache["values"].at[0,:,:values.shape[1]].set(values)
+    position_offset_new = keys.shape[1]
+    #keys = kv_cache['keys'][0]
+    #values = kv_cache['values'][0]
         
     new_cache = kv_cache
     keys_expanded = jnp.repeat(keys, group_size, axis=0)
     values_expanded = jnp.repeat(values, group_size, axis=0)
 
-    if pre:
-        output = attention_heads_prefill(queries, keys_expanded, values_expanded, params['out_proj'], pre, position_offset)
-    else:
-        # only compute on the non cached values
-        qp = jax.lax.dynamic_slice(queries, (0, position_offset,0), (16,1,128))
-        context = jax.vmap(attention_head, (0,0,0,None))(qp, keys_expanded, values_expanded, position_offset)
-        context = context.transpose(1,0,2).reshape(qp.shape[1], cfg['n_heads'] * cfg['head_dim'])
-        output = jnp.einsum('sh,hd->sd', context, params['out_proj'])
+    output = attention_heads_prefill(queries, keys_expanded, values_expanded, params['out_proj'], pre, position_offset)
+
+    return output, new_cache, position_offset_new
+
+
+def grouped_query_attention_forward_kv_gen(num_heads, num_kv_groups, head_dim, params, kv_cache, qk_norm, position_offset, x, pre=False):
+    cos, sin = compute_rope_params(cfg["head_dim"], cfg["rope_base"], cfg["context_length"])
+    group_size = num_heads // num_kv_groups
+    d_in = x.shape
+    
+    # during inference seqlen (new prefill tokens) is 1
+    queries = jnp.einsum('d,dh->h', x, params["W_query"]).reshape(num_heads, head_dim)[:, None]
+    keys = jnp.einsum('d,dh->h', x, params["W_key"]).reshape(num_kv_groups, head_dim)[:, None]
+
+    if qk_norm and "q_norm" in params and "k_norm" in params:
+        queries = apply_qk_norm(queries, params["q_norm"])
+        keys = apply_qk_norm(keys, params["k_norm"])
+
+    queries = apply_rope_with_offset(queries[None], cos, sin, position_offset)[0]
+    keys = apply_rope_with_offset(keys[None, :, 0:1], cos, sin, position_offset)[0, :, 0]
+
+    #values = jnp.einsum('sd,dh->sh', x, params["W_value"]).reshape(seq, num_kv_groups, head_dim).transpose(1,0,2)[:, 0:1]
+    values = jnp.einsum('d,dh->h', x, params["W_value"]).reshape(num_kv_groups, head_dim)
+
+    #keys2 = jnp.concat([kv_cache['keys'][0,:,:26], keys[:,0]])[0]
+    #values2 = jnp.concat([kv_cache['values'][0,:,:26], values[:,0]])[0]
+
+    kv_cache["keys"] = kv_cache["keys"].at[0,:,position_offset].set(keys)
+    kv_cache["values"] = kv_cache["values"].at[0,:,position_offset].set(values)
+
+    # this still atm runs the whole seqlen of the kv cache
+    # batch, heads, seqlen, embdim
+    keys = kv_cache['keys'][0]
+    values = kv_cache['values'][0]
+
+    #keys = jax.lax.dynamic_slice(keys, [0, 0, 0], (keys.shape[0], 1024, keys.shape[2]))
+    #values = jax.lax.dynamic_slice(values, [0, 0, 0], (values.shape[0], 1024, values.shape[2]))
+
+    # hardcoding the max amount of new tokens, limits prefill too for now
+    #keys = keys[:,:1024]
+    #values = values[:,:1024]
+
+    position_offset_new = position_offset + 1
+        
+    new_cache = kv_cache
+    keys_expanded = jnp.repeat(keys, group_size, axis=0)
+    values_expanded = jnp.repeat(values, group_size, axis=0)
+
+    # only compute on the non cached values
+    qp = jax.lax.dynamic_slice(queries, (0, position_offset,0), (16,1,128))
+    context = jax.vmap(attention_head, (0,0,0,None))(qp, keys_expanded, values_expanded, position_offset)
+    context = context.transpose(1,0,2).reshape(qp.shape[1], cfg['n_heads'] * cfg['head_dim'])
+    output = jnp.einsum('sh,hd->sd', context, params['out_proj'])
 
     return output, new_cache, position_offset_new
 
@@ -215,7 +220,11 @@ def grouped_query_attention_forward_kv(num_heads, num_kv_groups, head_dim, param
 def transformer_block_forward_kv(params, kv_cache, position_offset, x, pre=False):
     shortcut = x
     x = rmsnorm_forward(params["norm1"], x)
-    x, new_cache, position_offset = grouped_query_attention_forward_kv(cfg["n_heads"], cfg["n_kv_groups"], cfg["head_dim"], params["att"], kv_cache, cfg["qk_norm"], position_offset, x, pre)
+    if pre:
+        x, new_cache, position_offset = grouped_query_attention_forward_kv_pre(cfg["n_heads"], cfg["n_kv_groups"], cfg["head_dim"], params["att"], kv_cache, cfg["qk_norm"], position_offset, x, pre)
+    else:
+        x, new_cache, position_offset = grouped_query_attention_forward_kv_gen(cfg["n_heads"], cfg["n_kv_groups"], cfg["head_dim"], params["att"], kv_cache, cfg["qk_norm"], position_offset, x, pre)
+
     x = x + shortcut
     shortcut = x
     x = rmsnorm_forward(params["norm2"], x)
@@ -270,8 +279,7 @@ def gen(params, logits, kv_cache, position_offset,  max_new_tokens):
     [params, logits, kv_cache, position_offset], seq = jax.lax.scan(
             decode_step, 
             init=[params, logits, kv_cache, position_offset], length=max_new_tokens,
-            unroll=1, #20, # unroll = 2 crashes with internal error, unroll = 3 produces different result, false, 4, 5 are fine
-            # unroll 6 also is different like unroll 3
+            unroll=False, 
             )
     return [logits, kv_cache, position_offset], seq
 
@@ -289,7 +297,6 @@ def block(args):
 
 def generate_kv_optimized(model, idx, max_new_tokens, context_size, temperature=0.7, top_k=50, eos_id=None):
     params, cfg = model["params"], model["cfg"]
-    cfg.pop('dtype')
     
     # Keep input on device
     cur_ids = jnp.array([idx])
@@ -344,7 +351,7 @@ def generate_kv_optimized(model, idx, max_new_tokens, context_size, temperature=
     #logits, kv_cache, position_offset, cur_ids = gen(f, logits, kv_cache, position_offset, cur_ids2, max_new_tokens)
     #set_trace()
     #traced = jax.jit(gen, static_argnums=[3,4]).trace(params, logits, kv_cache, int(position_offset), max_new_tokens)
-    traced = jax.jit(gen, static_argnums=[4], donate_argnums=[]).trace(params, logits, kv_cache, int(position_offset), max_new_tokens)
+    traced = jax.jit(gen, static_argnums=[4], donate_argnums=[2]).trace(params, logits, kv_cache, int(position_offset), max_new_tokens)
     lowered = traced.lower()
     compiled_gen = lowered.compile()
     print('compiled')
@@ -377,7 +384,7 @@ def generate_kv_optimized(model, idx, max_new_tokens, context_size, temperature=
         cur_ids3 = jnp.array([[1999]*26])
         #[logits1, kv_cache1, position_offset1], seq = compiled_gen(params, logits, kv_cache)#, int(position_offset), max_new_tokens)
         [logits1, kv_cache1, position_offset1], seq = compiled_gen(params, logits, kv_cache, int(position_offset))#, max_new_tokens)
-        block([logits1, position_offset1, seq])
+        block([logits1, kv_cache1, position_offset1, seq])
 
         ft = time.perf_counter()
         tt = ft - stt

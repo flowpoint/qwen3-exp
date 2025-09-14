@@ -38,15 +38,9 @@ else:
 '''
 
 #device = jax.devices('gpu')[0] if jax.devices('gpu') else jax.devices('cpu')[0]
+dtype = dtype
 
 QWEN3_CONFIG = cfg
-'''
-{
-    "vocab_size": 151936, "context_length": 40960, "emb_dim": 1024, "n_heads": 16,
-    "n_layers": 28, "hidden_dim": 3072, "head_dim": 128, "qk_norm": True,
-    "n_kv_groups": 8, "rope_base": 1000000.0, "dtype": 'bfloat16', #torch.bfloat16,
-}
-'''
 
 class Qwen3Tokenizer():
     def __init__(self, tokenizer_file_path="tokenizer.json", repo_id=None):
@@ -83,7 +77,7 @@ def safe_convert_numpy_to_jax(numpy_array):
 
 def batch_convert_numpy_weights(numpy_weights_dict):
     converted = {key: safe_convert_numpy_to_jax(array) for key, array in numpy_weights_dict.items()}
-    return jax.tree.map(lambda x: jax.device_put(x.astype(jnp.bfloat16), device), converted)
+    return jax.tree.map(lambda x: jax.device_put(x.astype(dtype), device), converted)
 
 def cleanup_memory():
     '''
@@ -219,9 +213,9 @@ if __name__ == "__main__":
     tokenizer_path = model_path / "tokenizer.json"
     tokenizer = Qwen3Tokenizer(str(tokenizer_path) if tokenizer_path.exists() else "tokenizer.json", repo_id=HF_REPO_ID)
 
-    #pref_mul = 20_000
+    pref_mul = 20_000
     #pref_mul = 200
-    pref_mul = 1
+    #pref_mul = 1
     prompt = "Give me a short introduction to large language models."*pref_mul
     input_ids = tokenizer.encode(prompt)
     if len(input_ids) > QWEN3_CONFIG["context_length"]:
@@ -230,6 +224,7 @@ if __name__ == "__main__":
     # Keep input on device from start
     input_token_ids = jnp.array(input_ids)
     
+    cfg.pop('dtype') # needed because jax dtype object cant be passed to jit
     cfg = QWEN3_CONFIG
     key = jax.random.PRNGKey(0)
     params = init_qwen3_params(key, cfg)
