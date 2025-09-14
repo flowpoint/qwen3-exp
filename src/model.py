@@ -35,8 +35,8 @@ from model_utils import *
 dtype = jax.dtypes.bfloat16
 #dtype = jnp.float16
 #dtype = jnp.float32
-#cl = 40960
-cl = 8192
+cl = 40960
+#cl = 8192
 #cl = 1024
 
 cfg = {
@@ -53,10 +53,7 @@ def manual_vmap(att_head, queries, keys_expanded, values_expanded, pre, position
     carry, xr = jax.lax.scan(bodyfn, None, xs=(queries, keys_expanded, values_expanded), unroll=False)
     return xr
 
-#@partial(jax.jit, static_argnums=[3])
 def att_head_coder_causal(queries, keys, values, pre, position_offset, tile_size=2*1024):
-    #dtype_l = jnp.float64
-    #dtype_l = jnp.bfloat16
     dtype_l = dtype
     queries = queries.astype(dtype_l)
     keys = keys.astype(dtype_l)
@@ -176,6 +173,7 @@ def att_head_orig(queries, keys_expanded, values_expanded, pre, position_offset)
 
 
 def gen_att(queries, keys_expanded, values_expanded, position_offset):
+    ''' simpler, untiled attention for generation '''
     attn_scores = jnp.matmul(queries, keys_expanded.transpose(1,0)) / jnp.sqrt(cfg['head_dim'])
     mask = np.arange(keys_expanded.shape[0]) > position_offset + 1
     attn_scores = jnp.where(mask, -jnp.float_('inf'), attn_scores)
@@ -184,28 +182,17 @@ def gen_att(queries, keys_expanded, values_expanded, position_offset):
     return context
 
 
-#partial(jax.jit, static_argnums=[])
 def att2(queries, keys_expanded, values_expanded, out_proj, pre, position_offset, tiled=True):
-    #set_trace()
-    run = True
-
-    if run:
-        if tiled == True:
-            context = manual_vmap(att_head_coder_causal, queries, keys_expanded, values_expanded, pre, position_offset)
-        else:
-            context = manual_vmap(att_head_orig, queries, keys_expanded, values_expanded, pre, position_offset)
+    if tiled == True:
+        context = manual_vmap(att_head_coder_causal, queries, keys_expanded, values_expanded, pre, position_offset)
     else:
         context = manual_vmap(att_head_orig, queries, keys_expanded, values_expanded, pre, position_offset)
-        context2 = manual_vmap(att_head_coder_causal, queries, keys_expanded, values_expanded, pre, position_offset)
-        if not jnp.allclose(context, context2): #jnp.any(context - context1 > 0.001):
-            set_trace()
 
     context = context.transpose(1,0,2).reshape(queries.shape[1], cfg['n_heads'] * cfg['head_dim'])
     output = jnp.einsum('sh,hd->sd', context, out_proj)
     return output
     
 
-#@partial(jax.jit, static_argnums=[0,1,2,7,])
 def grouped_query_attention_forward_kv(num_heads, num_kv_groups, head_dim, params, kv_cache, qk_norm, position_offset, x, pre=False):
     cos, sin = compute_rope_params(cfg["head_dim"], cfg["rope_base"], cfg["context_length"])
     group_size = num_heads // num_kv_groups
@@ -329,191 +316,7 @@ def qwen3_forward_kv(params, x, cfg, kv_cache, position_offset, pre=False):
     
     return logits, new_cache, position_offset_new
 
-def qwen3_forward_kv3(params, x, cfg, kv_cache, position_offset, pre=False):
-    x = x[0,0]
 
-    x = params["tok_emb"][x]
-    new_cache = {"keys": [], "values":[]}
-    assert pre==False
-    kv_cache = {"keys":kv_cache['keys'][0], "values":kv_cache['values'][0]}
-
-    def scanf(i,x, layer_cache, prev_cache):
-        # of shape 1,8,seqlen, head
-        layer_cache = {"keys": kv_cache["keys"][i][None], "values": kv_cache["values"][i][None]}
-        x, updated_cache, position_offset_new = transformer_block_forward_kv(block_params, layer_cache, position_offset, x, pre=pre)
-        kv_cache['keys'] = kv_cache['keys'].at[i].set(updated_cache['keys'][0])
-        kv_cache['values'] = kv_cache['values'].at[i].set(updated_cache['values'][0])
-        x = x[0,0]
-        return x, position_offset_new, updated_cache
-
-    ud = []
-    i = 0
-    prev_cache = {"keys": kv_cache["keys"][i][None], "values": kv_cache["values"][i][None]}
-    for i, block_params in enumerate(params["trf_blocks"]):
-        x, position_offset_new, updated_cache = scanf(i, x, kv_cache, prev_cache)
-        ud.append(updated_cache)
-
-    '''
-    for updated_cache in ud:
-        kv_cache['keys'] = kv_cache['keys'].at[:,i].set(updated_cache['keys'])
-        kv_cache['values'] = kv_cache['values'].at[:,i].set(updated_cache['values'])
-    '''
-
-    kv_cache = {"keys":kv_cache['keys'][None], "values":kv_cache['values'][None]}
-    new_cache = kv_cache
-
-    x = rmsnorm_forward(params["final_norm"], x)
-    # cant do logits on prefill because it would be of shape [ctxlen, vocab] <- too big
-    if pre:
-        logits = jnp.matmul(x[-1:], params["out_head"])[None, :]
-    else:
-        logits = jnp.matmul(x[None], params["out_head"])[None, :]
-    
-    return logits, new_cache, position_offset_new
-
-
-# https://docs.liesel-project.org/en/v0.1.4/_modules/liesel/goose/pytree.html#stack_leaves
-# source from: https://github.com/jax-ml/jax/discussions/16882#discussioncomment-6638501
-def stack_leaves(pytrees, axis: int=0):
-    '''
-    Stack the leaves of one or more PyTrees along a new axis.
-
-    Args:
-        pytrees: One or more PyTrees.
-        axis (int, optional): The axis along which the arrays will be stacked. Default is 0.
-
-    Returns:
-        The PyTree with its leaves stacked along the new axis.
-    '''
-    return jax.tree_util.tree_map(lambda *xs: jnp.stack(xs, axis=axis), *pytrees)
-
-# https://gist.github.com/willwhitney/dd89cac6a5b771ccff18b06b33372c75?permalink_comment_id=4634557#gistcomment-4634557
-def unstack_leaves(pytrees):
-    '''
-    Unstack the leaves of a PyTree.
-
-    Args:
-        pytrees: A PyTree.
-
-    Returns:
-        A list of PyTrees, where each PyTree has the same structure as the input PyTree, but each leaf contains only one part of the original leaf.
-    '''
-    leaves, treedef = jax.tree_util.tree_flatten(pytrees)
-    return [treedef.unflatten(leaf) for leaf in zip(*leaves, strict=True)]
-
-
-def qwen3_forward_kv2(params, x, cfg, kv_cache, position_offset, pre=False):
-    if pre:
-        # unbatch
-        x = x[0]
-    else:
-        # unbatch and unseq
-        x = x[0,0]
-
-    x = params["tok_emb"][x]
-
-    # ---
-    ref=False
-    if ref:
-        x_ref = x
-        kv_cache_ref = {'keys':jnp.copy(kv_cache['keys']), 'values':jnp.copy(kv_cache['values'])}
-        new_cache_ref = {"keys": [], "values":[]}
-
-        for i, block_params in enumerate(params["trf_blocks"]):
-            #bp()
-            layer_cache_ref = {"keys": kv_cache_ref["keys"][:,i], "values": kv_cache_ref["values"][:,i]}
-            if 0:# i == 0:
-                jax.debug.print("{x}", x=layer_cache_ref['keys'])
-            #bp()
-            #set_trace()
-            x_ref, updated_cache_ref, position_offset_new_ref = transformer_block_forward_kv(block_params, layer_cache_ref, position_offset, x_ref, pre=pre)
-            kv_cache_ref['keys'] = kv_cache_ref['keys'].at[:,i].set(updated_cache_ref['keys'])
-            kv_cache_ref['values'] = kv_cache_ref['values'].at[:,i].set(updated_cache_ref['values'])
-            if pre:
-                x_ref = x_ref[0]
-            else:
-                x_ref = x_ref[0,0]
-
-        new_cache_ref = kv_cache_ref
-
-    if True:
-        # shape b, s, li, maxseq, head
-        keys = kv_cache["keys"][0]
-        #bp()
-        vals = kv_cache["values"][0]
-        blocks = params['trf_blocks']
-        x = x.astype(dtype)
-
-        init = (x,0, kv_cache)
-        xs = (stack_leaves(blocks), keys, vals, jnp.ones(keys.shape[0], dtype=jnp.int32) * position_offset)
-
-        def scan_fn(carry, params):
-            x,i,kv_cache = carry
-            x_ref = jnp.copy(x)
-
-            block_params, keys, vals, position_offset = params
-            keys = keys[None]
-            vals = vals[None]
-
-            layer_cache = {"keys": keys, "values": vals}
-            if 0: #i == 0:
-                jax.debug.print("{x}", x=layer_cache['keys'])
-            x, updated_cache, position_offset_new = transformer_block_forward_kv(block_params, layer_cache, position_offset, x, pre=pre)
-            keys2 = updated_cache['keys']
-            vals2 = updated_cache['values']
-
-            # --- 
-            if 1:
-                kv_cache_ref = kv_cache
-
-                layer_cache_ref = {"keys": kv_cache_ref["keys"][:,i], "values": kv_cache_ref["values"][:,i]}
-                if 0:# i == 0:
-                    jax.debug.print("{x}", x=layer_cache_ref['keys'])
-                #bp()
-                #set_trace()
-                x_ref, updated_cache_ref, position_offset_new_ref = transformer_block_forward_kv(block_params, layer_cache_ref, position_offset, x_ref, pre=pre)
-                kv_cache_ref['keys'] = kv_cache_ref['keys'].at[:,i].set(updated_cache_ref['keys'])
-                kv_cache_ref['values'] = kv_cache_ref['values'].at[:,i].set(updated_cache_ref['values'])
-                #bp()
-
-
-            if pre:
-                x = x[0]
-            else:
-                x = x[0,0]
-
-            '''
-            if pre:
-                x = x_ref[0]
-            else:
-                x = x_ref[0,0]
-            '''
-
-
-            return (x.astype(dtype),i+1, kv_cache), (keys2, vals2, position_offset_new)
-        
-        _, (keys, vals, pos_offs) = jax.lax.scan(scan_fn, init=init, xs=xs, length=len(blocks), unroll=False)
-        position_offset_new = pos_offs[-1]
-
-        #set_trace()
-        keys = keys[:,0][None]
-        vals = vals[:,0][None]
-        #kv_cache['keys'] = keys
-        #kv_cache['values'] = vals
-        kv_cache = {"keys": keys, "values":vals}
-        
-    x = rmsnorm_forward(params["final_norm"], x)
-
-    # cant do logits on prefill because it would be of shape [ctxlen, vocab] <- too big
-    if pre:
-        logits = jnp.matmul(x[-1:], params["out_head"])[None, :]
-    else:
-        logits = jnp.matmul(x[None], params["out_head"])[None, :]
-    
-    return logits, kv_cache, position_offset_new
-
-
-#scan(step, init=[params, cfg, kv_cache])(next_token, position_offset)
 def decode_step(carry,x):#logits, kv_cache, position_offset, cur_ids):
     params, logits, kv_cache, position_offset = carry
 
@@ -521,8 +324,7 @@ def decode_step(carry,x):#logits, kv_cache, position_offset, cur_ids):
     next_token = jnp.argmax(next_token_logits, axis=-1)
     
     # Process next tokens for entire batch
-    #logits2, kv_cache2, position_offset2 = qwen3_forward_kv(params, next_token[:, None], cfg, kv_cache, position_offset)
-    logits, kv_cache, position_offset = qwen3_forward_kv3(params, next_token[:, None], cfg, kv_cache, position_offset)
+    logits, kv_cache, position_offset = qwen3_forward_kv(params, next_token[:, None], cfg, kv_cache, position_offset)
     #if jnp.any(logits2[-1] != logits[-1]):
     #set_trace()
     #bp()
