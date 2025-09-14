@@ -14,7 +14,6 @@ from timeit import timeit
 import time
 import gc
 import operator
-
 from math import ceil
 
 bp = jax.debug.breakpoint
@@ -116,7 +115,6 @@ def att_head_coder_causal_pre(queries, keys, values, pre, position_offset, tile_
 
 
 def att_head_orig(queries, keys_expanded, values_expanded, pre, position_offset):
-    #attn_scores = jnp.einsum('qh,kh->qk', queries, keys_expanded) / jnp.sqrt(head_dim)
     attn_scores = jnp.matmul(queries, keys_expanded.transpose(1,0)) / jnp.sqrt(cfg['head_dim'])
 
     if pre:
@@ -128,10 +126,7 @@ def att_head_orig(queries, keys_expanded, values_expanded, pre, position_offset)
         mask = np.arange(keys_expanded.shape[0]) > position_offset + 1
         attn_scores = jnp.where(mask, -jnp.float_('inf'), attn_scores)
 
-    #return attn_scores
     attn_weights = jax.nn.softmax(attn_scores, axis=-1)
-
-    #context = jnp.einsum('qk,kh->qh', attn_weights, values_expanded)
     context = jnp.matmul(attn_weights, values_expanded)
     return context
 
@@ -215,8 +210,8 @@ def grouped_query_attention_forward_kv(num_heads, num_kv_groups, head_dim, param
         #values = jax.lax.dynamic_slice(values, [0, 0, 0], (values.shape[0], 1024, values.shape[2]))
 
         # hardcoding the max amount of new tokens, limits prefill too for now
-        keys = keys[:,:1024]
-        values = values[:,:1024]
+        #keys = keys[:,:1024]
+        #values = values[:,:1024]
 
         position_offset_new = position_offset + 1
         
@@ -236,7 +231,6 @@ def grouped_query_attention_forward_kv(num_heads, num_kv_groups, head_dim, param
     return output, new_cache, position_offset_new
 
 
-#@partial(jax.jit, static_argnums=[4], donate_argnums=[1])
 def transformer_block_forward_kv(params, kv_cache, position_offset, x, pre=False):
     shortcut = x
     x = rmsnorm_forward(params["norm1"], x)
@@ -248,7 +242,6 @@ def transformer_block_forward_kv(params, kv_cache, position_offset, x, pre=False
     return x + shortcut, new_cache, position_offset
 
 
-#@partial(jax.jit, static_argnums=[5], donate_argnums=[3])
 def qwen3_forward_kv(params, x, cfg, kv_cache, position_offset, pre=False):
     if pre:
         # unbatch
@@ -290,12 +283,8 @@ def decode_step(carry,x):#logits, kv_cache, position_offset, cur_ids):
     
     # Process next tokens for entire batch
     logits, kv_cache, position_offset = qwen3_forward_kv(params, next_token[:, None], cfg, kv_cache, position_offset)
-    #if jnp.any(logits2[-1] != logits[-1]):
-    #set_trace()
-    #bp()
     return [params, logits, kv_cache, position_offset ], next_token
 
-#@jax.jit
 def gen(params, logits, kv_cache, position_offset,  max_new_tokens):
     [params, logits, kv_cache, position_offset], seq = jax.lax.scan(
             decode_step, 
