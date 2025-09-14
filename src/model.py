@@ -35,7 +35,8 @@ from model_utils import *
 dtype = jax.dtypes.bfloat16
 #dtype = jnp.float16
 #dtype = jnp.float32
-cl = 40960
+#cl = 40960
+cl = 128
 #cl = 8192
 #cl = 1024
 
@@ -323,19 +324,33 @@ def generate_kv_optimized(model, idx, max_new_tokens, context_size, temperature=
     options.host_tracer_level = 3
     #with jax.profiler.trace("/tmp/jax-trace1", create_perfetto_link=True):
 
-    # compile prefill1
+    print('compiling prefill program')
     traced_pre = jax.jit(qwen3_forward_kv, static_argnums=[4,5], donate_argnums=[3]).trace(
             params, cur_ids, cfg, kv_cache, position_offset, pre=True)
     lowered = traced_pre.lower()
     compiled_pre = lowered.compile()
+    print('finished compiling prefill program')
+
+
+    print('compile generation program')
+    #cur_ids2 = jnp.array([[999]*26])
+    #logits, kv_cache, position_offset, cur_ids = gen(f, logits, kv_cache, position_offset, cur_ids2, max_new_tokens)
+    #set_trace()
+    #traced = jax.jit(gen, static_argnums=[3,4]).trace(params, logits, kv_cache, int(position_offset), max_new_tokens)
+    vocab_size = cfg['vocab_size']
+    logits = jnp.ones([1,1,vocab_size], dtype=dtype) / vocab_size
+    traced = jax.jit(gen, static_argnums=[4], donate_argnums=[2]).trace(params, logits, kv_cache, int(position_offset), max_new_tokens)
+    lowered = traced.lower()
+    compiled_gen = lowered.compile()
+    print('finished compile generation program')
 
     # run prefill
+    print('running prefill')
     stt = time.perf_counter()
     profile = False
     if profile:
         jax.profiler.start_trace("/tmp/jax-trace1")#, profiler_options=options)
 
-    print('starting prefill')
     logits, kv_cache, position_offset = compiled_pre(params, cur_ids, cfg, kv_cache)
     block([logits, position_offset])
 
@@ -346,62 +361,96 @@ def generate_kv_optimized(model, idx, max_new_tokens, context_size, temperature=
     toks = cur_ids.shape[-1]
     print(f"took: {tt} for {cur_ids.shape[-1]} at {toks/tt} toks/sec")
     print('prefilled')
+    print('running generation')
 
+
+    # warmup
+    warmup = False
+    if warmup:
+        cur_ids3 = jnp.array([[1999]*26])
+        #[logits1, kv_cache1, position_offset1], seq = compiled_gen(params, logits, kv_cache)#, int(position_offset), max_new_tokens)
+        [logits1, kv_cache1, position_offset1], seq = compiled_gen(params, logits, kv_cache, int(position_offset))#, max_new_tokens)
+        block([logits1, position_offset1, seq])
+        del logits1, kv_cache1, position_offset1
+        gc.collect()
+
+    stt = time.time()
+    profile = False
+    if profile:
+        jax.profiler.start_trace("/tmp/jax-trace1")#, profiler_options=options)
+
+    stt = time.perf_counter()
+    cur_ids3 = jnp.array([[1999]*26])
+    #[logits1, kv_cache1, position_offset1], seq = compiled_gen(params, logits, kv_cache)#, int(position_offset), max_new_tokens)
+    [logits1, kv_cache1, position_offset1], seq = compiled_gen(params, logits, kv_cache, int(position_offset))#, max_new_tokens)
+    block([logits1, kv_cache1, position_offset1, seq])
+
+    ft = time.perf_counter()
+    tt = ft - stt
+    #toks = 2*max_new_tokens
+    toks = 40960
+    print(f"took: {tt} for {2*max_new_tokens} at {toks/tt} toks/sec")
+
+    if profile:
+        jax.profiler.stop_trace()
+
+    return jnp.stack(seq, axis=-1)
+
+def generate_kv_optimized_programs(model, idx, max_new_tokens, context_size, temperature=0.7, top_k=50, eos_id=None):
+    params, cfg = model["params"], model["cfg"]
+    
+    # Keep input on device
+    cur_ids = jnp.array([idx])
+    key = jax.random.PRNGKey(42)
+    
+    # Initialize KV cache for batch processing
+    n_layers = cfg['n_layers']
+    n_kv_groups = cfg['n_kv_groups']
+    head_dim = cfg['head_dim']
+    kv_cache = {"keys": jnp.zeros((1, n_layers, n_kv_groups, context_size, head_dim), dtype=dtype), 
+                 "values": jnp.zeros((1, n_layers, n_kv_groups, context_size, head_dim),dtype=dtype)} 
+    csk = reduce(operator.mul, kv_cache['keys'].shape)
+    csv = reduce(operator.mul, kv_cache['values'].shape)
+    fs = csk+csv
+    prec_factor = 2 # for bfloat16 or float16
+    fs_gb = (fs / 1_000_000_000) * prec_factor
+
+    print(f"cache size is: {fs}")
+    print(f"cache size is: {fs_gb} GB")
+    position_offset = 0
+    
+    options = jax.profiler.ProfileOptions()
+    options.python_tracer_level = 0
+    options.host_tracer_level = 3
+    #with jax.profiler.trace("/tmp/jax-trace1", create_perfetto_link=True):
+
+    print('compiling prefill program')
+    traced_pre = jax.jit(qwen3_forward_kv, static_argnums=[4,5], donate_argnums=[3]).trace(
+            params, cur_ids, cfg, kv_cache, position_offset, pre=True)
+    lowered = traced_pre.lower()
+    compiled_pre = lowered.compile()
+    print('finished compiling prefill program')
+
+
+    print('compile generation program')
     #cur_ids2 = jnp.array([[999]*26])
     #logits, kv_cache, position_offset, cur_ids = gen(f, logits, kv_cache, position_offset, cur_ids2, max_new_tokens)
     #set_trace()
     #traced = jax.jit(gen, static_argnums=[3,4]).trace(params, logits, kv_cache, int(position_offset), max_new_tokens)
+    vocab_size = cfg['vocab_size']
+    logits = jnp.ones([1,1,vocab_size], dtype=dtype) / vocab_size
     traced = jax.jit(gen, static_argnums=[4], donate_argnums=[2]).trace(params, logits, kv_cache, int(position_offset), max_new_tokens)
     lowered = traced.lower()
     compiled_gen = lowered.compile()
-    print('compiled')
+    print('finished compile generation program')
 
-    use_lax = True
-    if use_lax:
-        # warmup
-        warmup = False
-        if warmup:
-            cur_ids3 = jnp.array([[1999]*26])
-            #[logits1, kv_cache1, position_offset1], seq = compiled_gen(params, logits, kv_cache)#, int(position_offset), max_new_tokens)
-            [logits1, kv_cache1, position_offset1], seq = compiled_gen(params, logits, kv_cache, int(position_offset))#, max_new_tokens)
-            block([logits1, position_offset1, seq])
-            del logits1, kv_cache1, position_offset1
-            gc.collect()
+    return kv_cache, compiled_pre, compiled_gen
 
-        stt = time.time()
-        profile = False
-        if profile:
-            jax.profiler.start_trace("/tmp/jax-trace1")#, profiler_options=options)
+def infer(params, cur_ids, cfg, kv_cache, compiled_pre, compiled_gen):
+    print('running prefill')
+    logits, kv_cache1, position_offset = compiled_pre(params, cur_ids, cfg, kv_cache)
+    print('prefilled')
+    print('running generation')
+    [logits1, kv_cache2, position_offset1], seq = compiled_gen(params, logits, kv_cache1, int(position_offset))
 
-        '''
-        cur_ids3 = jnp.array([[1999]*26])
-        #[logits1, kv_cache1, position_offset1], seq = compiled_gen(params, logits, kv_cache)#, int(position_offset), max_new_tokens)
-        [logits1, kv_cache1, position_offset1], seq = compiled_gen(params, logits, kv_cache, int(position_offset))#, max_new_tokens)
-        block([logits1, kv_cache1, position_offset1, seq])
-        '''
-
-        stt = time.perf_counter()
-        cur_ids3 = jnp.array([[1999]*26])
-        #[logits1, kv_cache1, position_offset1], seq = compiled_gen(params, logits, kv_cache)#, int(position_offset), max_new_tokens)
-        [logits1, kv_cache1, position_offset1], seq = compiled_gen(params, logits, kv_cache, int(position_offset))#, max_new_tokens)
-        block([logits1, kv_cache1, position_offset1, seq])
-
-        ft = time.perf_counter()
-        tt = ft - stt
-        toks = 2*max_new_tokens
-        print(f"took: {tt} for {2*max_new_tokens} at {toks/tt} toks/sec")
-
-        if profile:
-            jax.profiler.stop_trace()
-    else:
-        #set_trace()
-        seq = []
-        for i in tqdm(range(max_new_tokens), desc="Generating"):
-            #[logits, kv_cache, position_offset, ], seq = f([logits, kv_cache, position_offset, ], None)
-            [params, logits, kv_cache, position_offset], nt = decode_step([params, logits, kv_cache, position_offset], None )
-            seq.append(nt)
-            if eos_id is not None and cur_ids[-1] == eos_id:
-                break
-        seq = jnp.stack(seq)
-    
-    return jnp.stack(seq, axis=-1)
+    return jnp.stack(seq, axis=-1), kv_cache2

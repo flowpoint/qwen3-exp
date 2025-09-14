@@ -203,7 +203,8 @@ def load_qwen3_weights_jax_optimized(param_config, jax_params, safetensors_files
     
     return jax_params
 
-if __name__ == "__main__":
+#if __name__ == "__main__":
+if False:
     HF_REPO_ID = "Qwen/Qwen3-0.6B"
     
     model_path = download_model_from_hf(HF_REPO_ID)
@@ -255,3 +256,66 @@ if __name__ == "__main__":
     print(output_text)
     print(f"Time taken: {generation_time:.2f}s")
     print("="*50)
+
+if __name__ == "__main__":
+    HF_REPO_ID = "Qwen/Qwen3-0.6B"
+    
+    model_path = download_model_from_hf(HF_REPO_ID)
+    safetensors_files = list(Path(model_path).glob("*.safetensors"))
+    safetensors_files.sort()
+    
+    tokenizer_path = model_path / "tokenizer.json"
+    tokenizer = Qwen3Tokenizer(str(tokenizer_path) if tokenizer_path.exists() else "tokenizer.json", repo_id=HF_REPO_ID)
+
+    pref_mul = 20_000
+    #pref_mul = 200
+    #pref_mul = 1
+    prompt = "Give me a short introduction to large language models."*pref_mul
+    input_ids = tokenizer.encode(prompt)
+    if len(input_ids) > QWEN3_CONFIG["context_length"]:
+        input_ids = input_ids[:QWEN3_CONFIG["context_length"]]
+    
+    # Keep input on device from start
+    input_token_ids = jnp.array(input_ids)
+    
+    cfg.pop('dtype') # needed because jax dtype object cant be passed to jit
+    cfg = QWEN3_CONFIG
+    key = jax.random.PRNGKey(0)
+    params = init_qwen3_params(key, cfg)
+    params = load_qwen3_weights_jax_optimized(cfg, params, safetensors_files)
+    #import pickle
+    #pickle.dumps(params, 'params.pickle')
+    model = {"params": params, "cfg": cfg}
+    
+    import time
+    start_time = time.time()
+    
+    # Generate with optimized function (batch_size=1 for single sequence)
+    kv_cache, compiled_pre, compiled_gen = generate_kv_optimized_programs(
+        model=model, idx=input_token_ids, max_new_tokens=20,
+        context_size=QWEN3_CONFIG["context_length"], top_k=1,
+        temperature=0, eos_id=None
+    )
+    #tokenizer.tokenizer.enable_padding(length=40960)
+    tokenizer.tokenizer.enable_padding(length=128)
+
+    while 1:
+        prompt = input('> ')
+        #prompt = prompt.ljust(20000)
+        input_ids = tokenizer.encode(prompt)
+        if len(input_ids) > QWEN3_CONFIG["context_length"]:
+            input_ids = input_ids[:QWEN3_CONFIG["context_length"]]
+        # Keep input on device from start
+        #input_ids = [input_ids + ' '*20000]
+        input_token_ids = jnp.array(input_ids)
+        cur_ids = jnp.array([input_token_ids])
+        output_token_ids, kv_cache = infer(params, cur_ids, cfg, kv_cache, compiled_pre, compiled_gen)
+    
+        # Only move to CPU at the very end for decoding
+        output_text = tokenizer.decode(list(output_token_ids[0]))
+        print("\n" + "="*50)
+        print("GENERATED TEXT :")
+        print("="*50)
+        print(output_text)
+        #print(f"Time taken: {generation_time:.2f}s")
+        print("="*50)
