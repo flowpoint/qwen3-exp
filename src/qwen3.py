@@ -17,9 +17,10 @@ except ImportError:
     snapshot_download = None
 
 
-os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'true'
-os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.95'
-os.environ['JAX_ENABLE_COMPILATION_CACHE'] = 'true'
+#os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'true'
+#os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.95'
+#os.environ['JAX_ENABLE_COMPILATION_CACHE'] = 'true'
+
 #os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 os.environ['JAX_PLATFORMS'] = 'gpu'
 
@@ -233,7 +234,7 @@ if __name__ == "__main__":
     cfg = QWEN3_CONFIG
     key = jax.random.PRNGKey(0)
     params = init_qwen3_params(key, cfg)
-    params = load_qwen3_weights_jax_optimized(cfg, params, safetensors_files)
+    #params = load_qwen3_weights_jax_optimized(cfg, params, safetensors_files)
     #import pickle
     #pickle.dumps(params, 'params.pickle')
     model = {"params": params, "cfg": cfg}
