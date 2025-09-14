@@ -17,6 +17,7 @@ import operator
 from math import ceil
 
 bp = jax.debug.breakpoint
+jax.config.update('jax_numpy_dtype_promotion', 'strict')
 
 from functools import partial, reduce
 
@@ -34,8 +35,8 @@ from model_utils import *
 dtype = jax.dtypes.bfloat16
 #dtype = jnp.float16
 #dtype = jnp.float32
-cl = 40960
-#cl = 8192
+#cl = 40960
+cl = 8192
 #cl = 1024
 
 cfg = {
@@ -70,7 +71,7 @@ def att_head_coder_causal_pre(queries, keys, values, pre, position_offset, tile_
 
     Fi = jnp.zeros((m, values.shape[-1]), dtype=dtype_l)
     Li = jnp.zeros((m, 1), dtype=dtype_l)
-    Mi = jnp.full((m, 1), -jnp.inf, dtype=dtype_l)
+    Mi = jnp.full((m, 1), jnp.finfo(dtype_l).min, dtype=dtype_l)
     init = (Fi, Li, Mi, position_offset)
     init_pre = (Fi, Li, Mi)
 
@@ -124,7 +125,7 @@ def att_head_orig(queries, keys_expanded, values_expanded, pre, position_offset)
 
     else:
         mask = np.arange(keys_expanded.shape[0]) > position_offset + 1
-        attn_scores = jnp.where(mask, -jnp.float_('inf'), attn_scores)
+        attn_scores = jnp.where(mask, jnp.finfo(dtype).min, attn_scores)
 
     attn_weights = jax.nn.softmax(attn_scores, axis=-1)
     context = jnp.matmul(attn_weights, values_expanded)
@@ -135,7 +136,7 @@ def gen_att(queries, keys_expanded, values_expanded, position_offset):
     ''' simpler, untiled attention for generation '''
     attn_scores = jnp.matmul(queries, keys_expanded.transpose(1,0)) / jnp.sqrt(cfg['head_dim'])
     mask = np.arange(keys_expanded.shape[0]) > position_offset + 1
-    attn_scores = jnp.where(mask, -jnp.float_('inf'), attn_scores)
+    attn_scores = jnp.where(mask, jnp.finfo(dtype).min, attn_scores)
     attn_weights = jax.nn.softmax(attn_scores, axis=-1)
     context = jnp.matmul(attn_weights, values_expanded)
     return context
