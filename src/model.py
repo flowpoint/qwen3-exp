@@ -53,7 +53,7 @@ def manual_vmap(att_head, queries, keys_expanded, values_expanded, pre, position
     carry, xr = jax.lax.scan(bodyfn, None, xs=(queries, keys_expanded, values_expanded), unroll=False)
     return xr
 
-def att_head_coder_causal(queries, keys, values, pre, position_offset, tile_size=2*1024):
+def att_head_coder_causal_pre(queries, keys, values, pre, position_offset, tile_size=2*1024):
     dtype_l = dtype
     queries = queries.astype(dtype_l)
     keys = keys.astype(dtype_l)
@@ -63,15 +63,11 @@ def att_head_coder_causal(queries, keys, values, pre, position_offset, tile_size
     n, _ = keys.shape
     head_dim = d_k
 
-    if pre:
-        # only needed during prefill, otherwise m is 1, bc 1 token decode
-        pass#assert m % tile_size == 0, f"input shape must be padded to tile_size: {tile_size} but is {m}"
-    if pre:
-        # make tile_size match the tiny prefill
-        if m % tile_size != 0:
-            tile_size = queries.shape[0]
-    else:
-        tile_size = 1024
+    # TODO add check about correct tilesize evenly dividing the shapes
+    # only needed during prefill, otherwise m is 1, bc 1 token decode
+    # make tile_size match the tiny prefill
+    if m % tile_size != 0:
+        tile_size = queries.shape[0]
 
     Fi = jnp.zeros((m, values.shape[-1]), dtype=dtype_l)
     Li = jnp.zeros((m, 1), dtype=dtype_l)
@@ -79,38 +75,9 @@ def att_head_coder_causal(queries, keys, values, pre, position_offset, tile_size
     init = (Fi, Li, Mi, position_offset)
     init_pre = (Fi, Li, Mi)
 
-    #num_full_tiles = ceil(n / tile_size)
-    '''
-    context_size = cfg['context_length']
-    num_full_tiles = context_size // tile_size
-    assert context_size % tile_size == 0
-    '''
     num_full_tiles = n // tile_size
     ks = jnp.reshape(keys[:num_full_tiles * tile_size], (num_full_tiles, tile_size, d_k))
     vs = jnp.reshape(values[:num_full_tiles * tile_size], (num_full_tiles, tile_size, d_k))
-    #bp()
-
-    def causal_bodyfn(carry, scan_input):
-        k_chunk, v_chunk, start_idx = scan_input
-        F, L, M, position_offset = carry
-        logits = jnp.matmul(queries, k_chunk.T) / jnp.sqrt(head_dim)  # (m, tile_sz)
-        k_positions = jnp.arange(tile_size)[None, :] + start_idx  # (1, tile_sz)
-
-        # causal mask generation
-        causal_mask = k_positions > (position_offset + 1)  # (m, tile_sz)
-
-        logits = jnp.where(causal_mask, -jnp.inf, logits)
-
-        # Softmax
-        max_logits = jnp.max(logits, axis=-1, keepdims=True)
-        new_max = jnp.maximum(M, max_logits)
-        exp_logits = jnp.exp(logits - new_max)
-        old_shift = jnp.exp(M - new_max)
-        L2 = L * old_shift + jnp.sum(exp_logits, axis=-1, keepdims=True)
-        F2 = F * old_shift + jnp.matmul(exp_logits, v_chunk)
-        M2 = new_max
-
-        return (F2, L2, M2, position_offset), None
 
     def causal_bodyfn_pre(carry, scan_input):
         k_chunk, v_chunk, start_idx = scan_input
@@ -139,10 +106,7 @@ def att_head_coder_causal(queries, keys, values, pre, position_offset, tile_size
     start_indices = jnp.arange(0, num_full_tiles * tile_size, tile_size)
     scan_inputs = (ks, vs, start_indices)
 
-    if pre:
-        (Fn, Ln, _), _ = jax.lax.scan(causal_bodyfn_pre, init_pre, scan_inputs, unroll=False)
-    else:
-        (Fn, Ln, _, _), _ = jax.lax.scan(causal_bodyfn, init, scan_inputs, unroll=True)
+    (Fn, Ln, _), _ = jax.lax.scan(causal_bodyfn_pre, init_pre, scan_inputs, unroll=False)
 
     # no nans allowed
     # cant assert #assert jnp.all(Ln != 0.)
@@ -183,8 +147,9 @@ def gen_att(queries, keys_expanded, values_expanded, position_offset):
 
 
 def att2(queries, keys_expanded, values_expanded, out_proj, pre, position_offset, tiled=True):
-    if tiled == True:
-        context = manual_vmap(att_head_coder_causal, queries, keys_expanded, values_expanded, pre, position_offset)
+    # use tiling iff prefill
+    if pre:
+        context = manual_vmap(att_head_coder_causal_pre, queries, keys_expanded, values_expanded, pre, position_offset)
     else:
         context = manual_vmap(att_head_orig, queries, keys_expanded, values_expanded, pre, position_offset)
 
