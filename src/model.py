@@ -337,7 +337,8 @@ def qwen3_forward_kv3(params, x, cfg, kv_cache, position_offset, pre=False):
     assert pre==False
     kv_cache = {"keys":kv_cache['keys'][0], "values":kv_cache['values'][0]}
 
-    def scanf(i,x):
+    def scanf(i,x, layer_cache, prev_cache):
+        # of shape 1,8,seqlen, head
         layer_cache = {"keys": kv_cache["keys"][i][None], "values": kv_cache["values"][i][None]}
         x, updated_cache, position_offset_new = transformer_block_forward_kv(block_params, layer_cache, position_offset, x, pre=pre)
         kv_cache['keys'] = kv_cache['keys'].at[i].set(updated_cache['keys'][0])
@@ -346,8 +347,10 @@ def qwen3_forward_kv3(params, x, cfg, kv_cache, position_offset, pre=False):
         return x, position_offset_new, updated_cache
 
     ud = []
+    i = 0
+    prev_cache = {"keys": kv_cache["keys"][i][None], "values": kv_cache["values"][i][None]}
     for i, block_params in enumerate(params["trf_blocks"]):
-        x, position_offset_new, updated_cache = scanf(i,x)
+        x, position_offset_new, updated_cache = scanf(i, x, kv_cache, prev_cache)
         ud.append(updated_cache)
 
     '''
