@@ -216,12 +216,7 @@ def transformer_block_forward_kv(params, kv_cache, position_offset, x, pre=False
 
 
 def qwen3_forward_kv(params, x, cfg, kv_cache, position_offset, pre=False):
-    if pre:
-        # unbatch
-        x = x[0]
-    else:
-        # unbatch and unseq
-        x = x[0,0]
+    x = x[0,0]
 
     x = params["tok_emb"][x]
     new_cache = {"keys": [], "values":[]}
@@ -231,28 +226,20 @@ def qwen3_forward_kv(params, x, cfg, kv_cache, position_offset, pre=False):
         x, updated_cache, position_offset_new = transformer_block_forward_kv(block_params, layer_cache, position_offset, x, pre=pre)
         kv_cache['keys'] = kv_cache['keys'].at[:,i].set(updated_cache['keys'])
         kv_cache['values'] = kv_cache['values'].at[:,i].set(updated_cache['values'])
-        if pre:
-            x = x[0]
-        else:
-            x = x[0,0]
+        x = x[0,0]
 
     new_cache = kv_cache
 
     x = rmsnorm_forward(params["final_norm"], x)
-    # cant do logits on prefill because it would be of shape [ctxlen, vocab] <- too big
-    if pre:
-        logits = jnp.matmul(x[-1:], params["out_head"])[None, :]
-    else:
-        logits = jnp.matmul(x[None], params["out_head"])[None, :]
-    
+    logits = jnp.matmul(x[None], params["out_head"])[None, :]
     return logits, new_cache, position_offset_new
 
 
 def decode_step(carry,x):#logits, kv_cache, position_offset, cur_ids):
     params, logits, kv_cache, position_offset = carry
 
-    next_token_logits = logits[:, -1, :]
-    next_token = jnp.argmax(next_token_logits, axis=-1)
+    #next_token_logits = logits[:, -1, :]
+    next_token = jnp.array([0]) #jnp.argmax(next_token_logits, axis=-1)
     
     # Process next tokens for entire batch
     logits, kv_cache, position_offset = qwen3_forward_kv(params, next_token[:, None], cfg, kv_cache, position_offset)
@@ -272,7 +259,7 @@ def block(args):
 
 def generate_kv_optimized(model, idx, max_new_tokens, context_size, temperature=0.7, top_k=50, eos_id=None):
     params, cfg = model["params"], model["cfg"]
-    cfg.pop('dtype')
+    #cfg.pop('dtype')
     
     cur_ids = jnp.array([0])
     key = jax.random.PRNGKey(42)
@@ -298,3 +285,60 @@ def generate_kv_optimized(model, idx, max_new_tokens, context_size, temperature=
             )
     
     return jnp.stack(seq, axis=-1)
+
+def init_qwen3_params(key, cfg):
+    k_emb, k_blocks, k_final_norm, k_out = jax.random.split(key, 4)
+    tok_emb = jax.random.normal(k_emb, (cfg["vocab_size"], cfg["emb_dim"])) / jnp.sqrt(cfg["vocab_size"])
+    block_keys = jax.random.split(k_blocks, cfg["n_layers"])
+    
+    def init_block_params(k):
+        k_att, k_ff, k_norm1, k_norm2 = jax.random.split(k, 4)
+        kq, kk, kv, ko = jax.random.split(k_att, 4)
+        k_gate, k_up, k_down = jax.random.split(k_ff, 3)
+        
+        att_params = {
+            "W_query": jax.random.normal(kq, (cfg["emb_dim"], cfg["n_heads"] * cfg["head_dim"])) / jnp.sqrt(cfg["emb_dim"]),
+            "W_key": jax.random.normal(kk, (cfg["emb_dim"], cfg["n_kv_groups"] * cfg["head_dim"])) / jnp.sqrt(cfg["emb_dim"]),
+            "W_value": jax.random.normal(kv, (cfg["emb_dim"], cfg["n_kv_groups"] * cfg["head_dim"])) / jnp.sqrt(cfg["emb_dim"]),
+            "out_proj": jax.random.normal(ko, (cfg["n_heads"] * cfg["head_dim"], cfg["emb_dim"])) / jnp.sqrt(cfg["n_heads"] * cfg["head_dim"]),
+        }
+        
+        if cfg["qk_norm"]:
+            att_params["q_norm"] = {"scale": jnp.ones((cfg["head_dim"],))}
+            att_params["k_norm"] = {"scale": jnp.ones((cfg["head_dim"],))}
+        
+        return {
+            "att": att_params,
+            "ff": {
+                "gate_proj": jax.random.normal(k_gate, (cfg["emb_dim"], cfg["hidden_dim"])) / jnp.sqrt(cfg["emb_dim"]),
+                "up_proj": jax.random.normal(k_up, (cfg["emb_dim"], cfg["hidden_dim"])) / jnp.sqrt(cfg["emb_dim"]),
+                "down_proj": jax.random.normal(k_down, (cfg["hidden_dim"], cfg["emb_dim"])) / jnp.sqrt(cfg["hidden_dim"]),
+            },
+            "norm1": {"scale": jnp.ones((cfg["emb_dim"],))},
+            "norm2": {"scale": jnp.ones((cfg["emb_dim"],))},
+        }
+    
+    trf_blocks = [init_block_params(k) for k in block_keys]
+    final_norm = {"scale": jnp.ones((cfg["emb_dim"],))}
+    out_head = jax.random.normal(k_out, (cfg["emb_dim"], cfg["vocab_size"])) / jnp.sqrt(cfg["emb_dim"])
+    cos, sin = compute_rope_params(cfg["head_dim"], cfg["rope_base"], cfg["context_length"])
+    
+    params = {"tok_emb": tok_emb, "trf_blocks": trf_blocks, "final_norm": final_norm, "out_head": out_head, "cos": cos, "sin": sin}
+    
+    return jax.tree.map(lambda x: jax.device_put(x, device), params)
+
+
+if __name__ == "__main__":
+    input_token_ids = None
+    
+    key = jax.random.PRNGKey(0)
+    params = init_qwen3_params(key, cfg)
+    model = {"params": params, "cfg": cfg}
+    
+    # Generate with optimized function (batch_size=1 for single sequence)
+    output_token_ids = generate_kv_optimized(
+        model=model, idx=input_token_ids, max_new_tokens=20,
+        context_size=cfg["context_length"], top_k=1,
+        temperature=0, eos_id=None
+    )
+
