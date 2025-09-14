@@ -320,9 +320,6 @@ def generate_kv_optimized(model, idx, max_new_tokens, context_size, temperature=
     head_dim = cfg['head_dim']
     kv_cache = {"keys": jnp.zeros((1, n_layers, n_kv_groups, context_size, head_dim), dtype=dtype), 
                  "values": jnp.zeros((1, n_layers, n_kv_groups, context_size, head_dim),dtype=dtype)} 
-    csk = reduce(operator.mul, kv_cache['keys'].shape)
-    csv = reduce(operator.mul, kv_cache['values'].shape)
-    position_offset = 0
 
     position_offset = 26
     logits = jnp.ones([1,1,151936])
@@ -332,83 +329,9 @@ def generate_kv_optimized(model, idx, max_new_tokens, context_size, temperature=
     compiled_gen = lowered.compile()
     print('compiled')
 
-    use_lax = True
-    if use_lax:
-        # warmup
-        warmup = False
-        if warmup:
-            cur_ids3 = jnp.array([[1999]*26])
-            #[logits1, kv_cache1, position_offset1], seq = compiled_gen(params, logits, kv_cache)#, int(position_offset), max_new_tokens)
-            [logits1, kv_cache1, position_offset1], seq = compiled_gen(params, logits, kv_cache, int(position_offset))#, max_new_tokens)
-            block([logits1, position_offset1, seq])
-            #del logits1, kv_cache1, position_offset1
-            gc.collect()
-
-        stt = time.time()
-        profile = False
-        if profile:
-            jax.profiler.start_trace("/tmp/jax-trace1")#, profiler_options=options)
-
-        '''
-        cur_ids3 = jnp.array([[1999]*26])
-        #[logits1, kv_cache1, position_offset1], seq = compiled_gen(params, logits, kv_cache)#, int(position_offset), max_new_tokens)
-        [logits1, kv_cache1, position_offset1], seq = compiled_gen(params, logits, kv_cache, int(position_offset))#, max_new_tokens)
-        block([logits1, kv_cache1, position_offset1, seq])
-        '''
-
-        stt = time.perf_counter()
-        cur_ids3 = jnp.array([[1999]*26])
-        #[logits1, kv_cache1, position_offset1], seq = compiled_gen(params, logits, kv_cache)#, int(position_offset), max_new_tokens)
-        [logits1, kv_cache1, position_offset1], seq = compiled_gen(params, logits, kv_cache, int(position_offset))#, max_new_tokens)
-        block([logits1, position_offset1, seq])
-
-        ft = time.perf_counter()
-        tt = ft - stt
-        toks = 2*max_new_tokens
-        print(f"took: {tt} for {2*max_new_tokens} at {toks/tt} toks/sec")
-
-        if profile:
-            jax.profiler.stop_trace()
-    else:
-        #set_trace()
-        seq = []
-        for i in tqdm(range(max_new_tokens), desc="Generating"):
-            #[logits, kv_cache, position_offset, ], seq = f([logits, kv_cache, position_offset, ], None)
-            [params, logits, kv_cache, position_offset], nt = decode_step([params, logits, kv_cache, position_offset], None )
-            seq.append(nt)
-            if eos_id is not None and cur_ids[-1] == eos_id:
-                break
-        seq = jnp.stack(seq)
-
-    
-    '''
-    for i in tqdm(range(max_new_tokens), desc="Generating"):
-        next_token_logits = logits[:, -1, :]
-        
-        if top_k is not None and top_k > 0:
-            # Vectorized top_k for batch processing
-            top_k_logits, top_k_indices = jax.lax.top_k(next_token_logits, top_k)
-            mask = jnp.full_like(next_token_logits, -jnp.inf)
-            mask = jnp.take_along_axis(mask, top_k_indices, axis=-1)
-            mask = jnp.where(jnp.arange(mask.shape[-1])[None, :] < top_k, top_k_logits, -jnp.inf)
-            next_token_logits = jnp.full_like(next_token_logits, -jnp.inf)
-            next_token_logits = next_token_logits.at[jnp.arange(1)[:, None], top_k_indices].set(mask)
-        
-        if temperature > 0.0:
-            next_token_logits = next_token_logits / temperature
-            key, subkey = jax.random.split(key)
-            next_token = jax.random.categorical(subkey, next_token_logits, axis=-1)
-        else:
-            next_token = jnp.argmax(next_token_logits, axis=-1)
-        
-        # Check EOS for all sequences in batch - keep on device
-        if eos_id is not None and jnp.any(next_token == eos_id):
-            break
-        
-        cur_ids = jnp.concatenate([cur_ids, next_token[:, None]], axis=1)
-        
-        # Process next tokens for entire batch
-        logits, kv_cache, position_offset = qwen3_forward_kv(params, next_token[:, None], cfg, kv_cache, position_offset)
-        '''
+    cur_ids3 = jnp.array([[1999]*26])
+    #[logits1, kv_cache1, position_offset1], seq = compiled_gen(params, logits, kv_cache)#, int(position_offset), max_new_tokens)
+    [logits1, kv_cache1, position_offset1], seq = compiled_gen(params, logits, kv_cache, int(position_offset))#, max_new_tokens)
+    block([logits1, position_offset1, seq])
     
     return jnp.stack(seq, axis=-1)
