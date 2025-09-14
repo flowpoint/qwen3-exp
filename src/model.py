@@ -206,12 +206,12 @@ def grouped_query_attention_forward_kv(num_heads, num_kv_groups, head_dim, param
         values = kv_cache['values'][0]
 
         #set_trace()
-        #keys = jax.lax.dynamic_slice(keys, [0, 0, 0], (keys.shape[0], 1024, keys.shape[2]))
-        #values = jax.lax.dynamic_slice(values, [0, 0, 0], (values.shape[0], 1024, values.shape[2]))
+        #keys = jax.lax.dynamic_slice(keys, [0, 0, 0], (keys.shape[0], position_offset, keys.shape[2]))
+        #values = jax.lax.dynamic_slice(values, [0, 0, 0], (values.shape[0], position_offset, values.shape[2]))
 
         # hardcoding the max amount of new tokens, limits prefill too for now
-        #keys = keys[:,:1024]
-        #values = values[:,:1024]
+        #keys = keys[:,:cl//2]
+        #values = values[:,:cl//2]
 
         position_offset_new = position_offset + 1
         
@@ -322,48 +322,12 @@ def generate_kv_optimized(model, idx, max_new_tokens, context_size, temperature=
                  "values": jnp.zeros((1, n_layers, n_kv_groups, context_size, head_dim),dtype=dtype)} 
     csk = reduce(operator.mul, kv_cache['keys'].shape)
     csv = reduce(operator.mul, kv_cache['values'].shape)
-    fs = csk+csv
-    prec_factor = 2 # for bfloat16 or float16
-    fs_gb = (fs / 1_000_000_000) * prec_factor
-
-    print(f"cache size is: {fs}")
-    print(f"cache size is: {fs_gb} GB")
     position_offset = 0
-    
-    options = jax.profiler.ProfileOptions()
-    options.python_tracer_level = 0
-    options.host_tracer_level = 3
-    #with jax.profiler.trace("/tmp/jax-trace1", create_perfetto_link=True):
 
-    # compile prefill1
-    traced_pre = jax.jit(qwen3_forward_kv, static_argnums=[4,5], donate_argnums=[3]).trace(
-            params, cur_ids, cfg, kv_cache, position_offset, pre=True)
-    lowered = traced_pre.lower()
-    compiled_pre = lowered.compile()
+    position_offset = 26
+    logits = jnp.ones([1,1,151936])
 
-    # run prefill
-    stt = time.perf_counter()
-    profile = False
-    if profile:
-        jax.profiler.start_trace("/tmp/jax-trace1")#, profiler_options=options)
-
-    print('starting prefill')
-    logits, kv_cache, position_offset = compiled_pre(params, cur_ids, cfg, kv_cache)
-    block([logits, position_offset])
-
-    if profile:
-        jax.profiler.stop_trace()
-    ft = time.perf_counter()
-    tt = ft - stt
-    toks = cur_ids.shape[-1]
-    print(f"took: {tt} for {cur_ids.shape[-1]} at {toks/tt} toks/sec")
-    print('prefilled')
-
-    #cur_ids2 = jnp.array([[999]*26])
-    #logits, kv_cache, position_offset, cur_ids = gen(f, logits, kv_cache, position_offset, cur_ids2, max_new_tokens)
-    #set_trace()
-    #traced = jax.jit(gen, static_argnums=[3,4]).trace(params, logits, kv_cache, int(position_offset), max_new_tokens)
-    traced = jax.jit(gen, static_argnums=[4], donate_argnums=[]).trace(params, logits, kv_cache, int(position_offset), max_new_tokens)
+    traced = jax.jit(gen, static_argnums=[4]).trace(params, logits, kv_cache, int(position_offset), max_new_tokens)
     lowered = traced.lower()
     compiled_gen = lowered.compile()
     print('compiled')
@@ -377,7 +341,7 @@ def generate_kv_optimized(model, idx, max_new_tokens, context_size, temperature=
             #[logits1, kv_cache1, position_offset1], seq = compiled_gen(params, logits, kv_cache)#, int(position_offset), max_new_tokens)
             [logits1, kv_cache1, position_offset1], seq = compiled_gen(params, logits, kv_cache, int(position_offset))#, max_new_tokens)
             block([logits1, position_offset1, seq])
-            del logits1, kv_cache1, position_offset1
+            #del logits1, kv_cache1, position_offset1
             gc.collect()
 
         stt = time.time()
