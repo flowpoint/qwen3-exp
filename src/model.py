@@ -35,8 +35,8 @@ from model_utils import *
 dtype = jax.dtypes.bfloat16
 #dtype = jnp.float16
 #dtype = jnp.float32
-cl = 40960
-#cl = 8192
+#cl = 40960
+cl = 8192
 #cl = 1024
 
 cfg = {
@@ -329,6 +329,44 @@ def qwen3_forward_kv(params, x, cfg, kv_cache, position_offset, pre=False):
     
     return logits, new_cache, position_offset_new
 
+def qwen3_forward_kv3(params, x, cfg, kv_cache, position_offset, pre=False):
+    x = x[0,0]
+
+    x = params["tok_emb"][x]
+    new_cache = {"keys": [], "values":[]}
+    assert pre==False
+    kv_cache = {"keys":kv_cache['keys'][0], "values":kv_cache['values'][0]}
+
+    def scanf(i,x):
+        layer_cache = {"keys": kv_cache["keys"][i][None], "values": kv_cache["values"][i][None]}
+        x, updated_cache, position_offset_new = transformer_block_forward_kv(block_params, layer_cache, position_offset, x, pre=pre)
+        kv_cache['keys'] = kv_cache['keys'].at[i].set(updated_cache['keys'][0])
+        kv_cache['values'] = kv_cache['values'].at[i].set(updated_cache['values'][0])
+        x = x[0,0]
+        return x, position_offset_new, updated_cache
+
+    ud = []
+    for i, block_params in enumerate(params["trf_blocks"]):
+        x, position_offset_new, updated_cache = scanf(i,x)
+        ud.append(updated_cache)
+
+    '''
+    for updated_cache in ud:
+        kv_cache['keys'] = kv_cache['keys'].at[:,i].set(updated_cache['keys'])
+        kv_cache['values'] = kv_cache['values'].at[:,i].set(updated_cache['values'])
+    '''
+
+    kv_cache = {"keys":kv_cache['keys'][None], "values":kv_cache['values'][None]}
+    new_cache = kv_cache
+
+    x = rmsnorm_forward(params["final_norm"], x)
+    # cant do logits on prefill because it would be of shape [ctxlen, vocab] <- too big
+    if pre:
+        logits = jnp.matmul(x[-1:], params["out_head"])[None, :]
+    else:
+        logits = jnp.matmul(x[None], params["out_head"])[None, :]
+    
+    return logits, new_cache, position_offset_new
 
 
 # https://docs.liesel-project.org/en/v0.1.4/_modules/liesel/goose/pytree.html#stack_leaves
@@ -362,12 +400,6 @@ def unstack_leaves(pytrees):
 
 
 def qwen3_forward_kv2(params, x, cfg, kv_cache, position_offset, pre=False):
-    x = params["tok_emb"][x]
-    # shape b, s, li, maxseq, head
-    keys = kv_cache["keys"][0]
-    vals = kv_cache["values"][0]
-    blocks = params['trf_blocks']
-
     if pre:
         # unbatch
         x = x[0]
@@ -375,37 +407,98 @@ def qwen3_forward_kv2(params, x, cfg, kv_cache, position_offset, pre=False):
         # unbatch and unseq
         x = x[0,0]
 
-    init = (x,)
-    layers = 28
-    xs = (stack_leaves(blocks), keys, vals)
+    x = params["tok_emb"][x]
 
-    def scan_fn(carry, params):
-        x = carry[0]
-        set_trace()
-        block_params, keys, vals = params
-        keys = keys[None]
-        vals = vals[None]
+    # ---
+    ref=False
+    if ref:
+        x_ref = x
+        kv_cache_ref = {'keys':jnp.copy(kv_cache['keys']), 'values':jnp.copy(kv_cache['values'])}
+        new_cache_ref = {"keys": [], "values":[]}
 
-        layer_cache = {"keys": keys, "values": vals}
-        x, updated_cache, position_offset_new = transformer_block_forward_kv(block_params, layer_cache, position_offset, x, pre=pre)
-        keys2 = updated_cache['keys']
-        vals2 = updated_cache['values']
+        for i, block_params in enumerate(params["trf_blocks"]):
+            #bp()
+            layer_cache_ref = {"keys": kv_cache_ref["keys"][:,i], "values": kv_cache_ref["values"][:,i]}
+            if 0:# i == 0:
+                jax.debug.print("{x}", x=layer_cache_ref['keys'])
+            #bp()
+            #set_trace()
+            x_ref, updated_cache_ref, position_offset_new_ref = transformer_block_forward_kv(block_params, layer_cache_ref, position_offset, x_ref, pre=pre)
+            kv_cache_ref['keys'] = kv_cache_ref['keys'].at[:,i].set(updated_cache_ref['keys'])
+            kv_cache_ref['values'] = kv_cache_ref['values'].at[:,i].set(updated_cache_ref['values'])
+            if pre:
+                x_ref = x_ref[0]
+            else:
+                x_ref = x_ref[0,0]
 
-        if pre:
-            x = x[0]
-        else:
-            x = x[0,0]
+        new_cache_ref = kv_cache_ref
 
-        return carry, (keys2, vals2)
-    
-    _, (keys, vals) = jax.lax.scan(scan_fn, init=init, xs=xs, length=len(blocks), unroll=False)
+    if True:
+        # shape b, s, li, maxseq, head
+        keys = kv_cache["keys"][0]
+        #bp()
+        vals = kv_cache["values"][0]
+        blocks = params['trf_blocks']
+        x = x.astype(dtype)
 
-    set_trace()
-    keys = keys[:,0][None]
-    vals = vals[:,0][None]
-    kv_cache['keys'] = keys
-    kv_cache['values'] = vals
-    
+        init = (x,0, kv_cache)
+        xs = (stack_leaves(blocks), keys, vals, jnp.ones(keys.shape[0], dtype=jnp.int32) * position_offset)
+
+        def scan_fn(carry, params):
+            x,i,kv_cache = carry
+            x_ref = jnp.copy(x)
+
+            block_params, keys, vals, position_offset = params
+            keys = keys[None]
+            vals = vals[None]
+
+            layer_cache = {"keys": keys, "values": vals}
+            if 0: #i == 0:
+                jax.debug.print("{x}", x=layer_cache['keys'])
+            x, updated_cache, position_offset_new = transformer_block_forward_kv(block_params, layer_cache, position_offset, x, pre=pre)
+            keys2 = updated_cache['keys']
+            vals2 = updated_cache['values']
+
+            # --- 
+            if 1:
+                kv_cache_ref = kv_cache
+
+                layer_cache_ref = {"keys": kv_cache_ref["keys"][:,i], "values": kv_cache_ref["values"][:,i]}
+                if 0:# i == 0:
+                    jax.debug.print("{x}", x=layer_cache_ref['keys'])
+                #bp()
+                #set_trace()
+                x_ref, updated_cache_ref, position_offset_new_ref = transformer_block_forward_kv(block_params, layer_cache_ref, position_offset, x_ref, pre=pre)
+                kv_cache_ref['keys'] = kv_cache_ref['keys'].at[:,i].set(updated_cache_ref['keys'])
+                kv_cache_ref['values'] = kv_cache_ref['values'].at[:,i].set(updated_cache_ref['values'])
+                #bp()
+
+
+            if pre:
+                x = x[0]
+            else:
+                x = x[0,0]
+
+            '''
+            if pre:
+                x = x_ref[0]
+            else:
+                x = x_ref[0,0]
+            '''
+
+
+            return (x.astype(dtype),i+1, kv_cache), (keys2, vals2, position_offset_new)
+        
+        _, (keys, vals, pos_offs) = jax.lax.scan(scan_fn, init=init, xs=xs, length=len(blocks), unroll=False)
+        position_offset_new = pos_offs[-1]
+
+        #set_trace()
+        keys = keys[:,0][None]
+        vals = vals[:,0][None]
+        #kv_cache['keys'] = keys
+        #kv_cache['values'] = vals
+        kv_cache = {"keys": keys, "values":vals}
+        
     x = rmsnorm_forward(params["final_norm"], x)
 
     # cant do logits on prefill because it would be of shape [ctxlen, vocab] <- too big
@@ -414,10 +507,7 @@ def qwen3_forward_kv2(params, x, cfg, kv_cache, position_offset, pre=False):
     else:
         logits = jnp.matmul(x[None], params["out_head"])[None, :]
     
-    if pre:
-        return logits, kv_cache, x.shape[0] + 1
-    else:
-        return logits, kv_cache, position_offset + 1
+    return logits, kv_cache, position_offset_new
 
 
 #scan(step, init=[params, cfg, kv_cache])(next_token, position_offset)
@@ -428,7 +518,11 @@ def decode_step(carry,x):#logits, kv_cache, position_offset, cur_ids):
     next_token = jnp.argmax(next_token_logits, axis=-1)
     
     # Process next tokens for entire batch
-    logits, kv_cache, position_offset = qwen3_forward_kv(params, next_token[:, None], cfg, kv_cache, position_offset)
+    #logits2, kv_cache2, position_offset2 = qwen3_forward_kv(params, next_token[:, None], cfg, kv_cache, position_offset)
+    logits, kv_cache, position_offset = qwen3_forward_kv3(params, next_token[:, None], cfg, kv_cache, position_offset)
+    #if jnp.any(logits2[-1] != logits[-1]):
+    #set_trace()
+    #bp()
     return [params, logits, kv_cache, position_offset ], next_token
 
 #@jax.jit
