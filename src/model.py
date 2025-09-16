@@ -35,8 +35,8 @@ from model_utils import *
 dtype = jax.dtypes.bfloat16
 #dtype = jnp.float16
 #dtype = jnp.float32
-#cl = 40960
-cl = 128
+cl = 40960
+#cl = 128
 #cl = 8192
 #cl = 1024
 
@@ -187,9 +187,13 @@ def grouped_query_attention_forward_kv_gen(num_heads, num_kv_groups, head_dim, p
 
     #keys2 = jnp.concat([kv_cache['keys'][0,:,:26], keys[:,0]])[0]
     #values2 = jnp.concat([kv_cache['values'][0,:,:26], values[:,0]])[0]
+    #bp()
 
     kv_cache["keys"] = kv_cache["keys"].at[0,:,position_offset].set(keys)
     kv_cache["values"] = kv_cache["values"].at[0,:,position_offset].set(values)
+
+    new_k = keys
+    new_v = values
 
     # this still atm runs the whole seqlen of the kv cache
     # batch, heads, seqlen, embdim
@@ -205,7 +209,7 @@ def grouped_query_attention_forward_kv_gen(num_heads, num_kv_groups, head_dim, p
 
     position_offset_new = position_offset + 1
         
-    new_cache = kv_cache
+    new_cache = {"keys": new_k, "values":new_v}
     keys_expanded = jnp.repeat(keys, group_size, axis=0)
     values_expanded = jnp.repeat(values, group_size, axis=0)
 
@@ -247,11 +251,15 @@ def qwen3_forward_kv(params, x, cfg, kv_cache, position_offset, pre=False):
     for i, block_params in enumerate(params["trf_blocks"]):
         layer_cache = {"keys": kv_cache["keys"][:,i], "values": kv_cache["values"][:,i]}
         x, updated_cache, position_offset_new = transformer_block_forward_kv(block_params, layer_cache, position_offset, x, pre=pre)
-        kv_cache['keys'] = kv_cache['keys'].at[:,i].set(updated_cache['keys'])
-        kv_cache['values'] = kv_cache['values'].at[:,i].set(updated_cache['values'])
         if pre:
+
+            kv_cache['keys'] = kv_cache['keys'].at[:,i].set(updated_cache['keys'])
+            kv_cache['values'] = kv_cache['values'].at[:,i].set(updated_cache['values'])
             x = x[0]
         else:
+            #set_trace()
+            kv_cache["keys"] = kv_cache["keys"].at[0, i,:, position_offset].set(updated_cache['keys'])
+            kv_cache["values"] = kv_cache["values"].at[0, i,:, position_offset].set(updated_cache['values'])
             x = x[0,0]
 
     new_cache = kv_cache
@@ -339,7 +347,7 @@ def generate_kv_optimized(model, idx, max_new_tokens, context_size, temperature=
     #traced = jax.jit(gen, static_argnums=[3,4]).trace(params, logits, kv_cache, int(position_offset), max_new_tokens)
     vocab_size = cfg['vocab_size']
     logits = jnp.ones([1,1,vocab_size], dtype=dtype) / vocab_size
-    traced = jax.jit(gen, static_argnums=[4], donate_argnums=[2]).trace(params, logits, kv_cache, int(position_offset), max_new_tokens)
+    traced = jax.jit(gen, static_argnums=[4], donate_argnums=[]).trace(params, logits, kv_cache, int(position_offset), max_new_tokens)
     lowered = traced.lower()
     compiled_gen = lowered.compile()
     print('finished compile generation program')
@@ -379,17 +387,17 @@ def generate_kv_optimized(model, idx, max_new_tokens, context_size, temperature=
     if profile:
         jax.profiler.start_trace("/tmp/jax-trace1")#, profiler_options=options)
 
-    stt = time.perf_counter()
-    cur_ids3 = jnp.array([[1999]*26])
+    stt2 = time.perf_counter()
     #[logits1, kv_cache1, position_offset1], seq = compiled_gen(params, logits, kv_cache)#, int(position_offset), max_new_tokens)
     [logits1, kv_cache1, position_offset1], seq = compiled_gen(params, logits, kv_cache, int(position_offset))#, max_new_tokens)
     block([logits1, kv_cache1, position_offset1, seq])
 
-    ft = time.perf_counter()
-    tt = ft - stt
+    ft2 = time.perf_counter()
+    tt2 = ft2 - stt2
     #toks = 2*max_new_tokens
-    toks = 40960
-    print(f"took: {tt} for {2*max_new_tokens} at {toks/tt} toks/sec")
+    toks2 = seq.shape[-2]
+    #set_trace()
+    print(f"took: {tt2} for {toks2} at {toks2/tt2} toks/sec")
 
     if profile:
         jax.profiler.stop_trace()
