@@ -40,6 +40,7 @@ cl = 40960
 #cl = 128
 #cl = 8192
 #cl = 1024
+#cl = 4096
 
 cfg = {
     "vocab_size": 151936, "context_length": cl, "emb_dim": 1024, "n_heads": 16,
@@ -123,7 +124,7 @@ def manual_vmap(att_head, queries, keys_expanded, values_expanded, pre, position
         queries, keys_expanded, values_expanded = x
         x = att_head(queries, keys_expanded, values_expanded, pre, position_offset)
         return carry, x
-    carry, xr = jax.lax.scan(bodyfn, None, xs=(queries, keys_expanded, values_expanded), unroll=False)
+    carry, xr = jax.lax.scan(bodyfn, None, xs=(queries, keys_expanded, values_expanded), unroll=True)
     return xr
 
 
@@ -282,14 +283,16 @@ def decode_step(carry,x):#logits, kv_cache, position_offset, cur_ids):
     next_token = jnp.argmax(next_token_logits, axis=-1)
     
     # Process next tokens for entire batch
-    logits, kv_cache, position_offset = qwen3_forward_kv(params, next_token[:, None], cfg, kv_cache, position_offset)
+    # TODO access bounds position here
+    logits, kv_cache, position_offset2 = qwen3_forward_kv(params, next_token[:, None], cfg, kv_cache, position_offset)
     return [params, logits, kv_cache, position_offset ], next_token
 
 def gen(params, logits, kv_cache, position_offset,  max_new_tokens):
     [params, logits, kv_cache, position_offset], seq = jax.lax.scan(
             decode_step, 
-            init=[params, logits, kv_cache, position_offset], length=max_new_tokens,
-            unroll=False, 
+            init=[params, logits, kv_cache, position_offset], 
+            length=max_new_tokens,
+            unroll=4, 
             )
     return [logits, kv_cache, position_offset], seq
 
@@ -352,7 +355,7 @@ def generate_kv_optimized(model, idx, max_new_tokens, context_size, temperature=
     if profile:
         #max_new_tokens = 2
         pass
-    traced = jax.jit(gen, static_argnums=[4], donate_argnums=[]).trace(params, logits, kv_cache, int(position_offset), max_new_tokens)
+    traced = jax.jit(gen, static_argnums=[4], donate_argnums=[2]).trace(params, logits, kv_cache, int(position_offset), max_new_tokens)
     lowered = traced.lower()
     compiled_gen = lowered.compile()
     print('finished compile generation program')

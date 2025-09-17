@@ -214,6 +214,7 @@ def run():
     tokenizer_path = model_path / "tokenizer.json"
     tokenizer = Qwen3Tokenizer(str(tokenizer_path) if tokenizer_path.exists() else "tokenizer.json", repo_id=HF_REPO_ID)
 
+    max_new_tokens = 16
     pref_mul = 20_000
     #pref_mul = 200
     #pref_mul = 1
@@ -239,7 +240,7 @@ def run():
     
     # Generate with optimized function (batch_size=1 for single sequence)
     output_token_ids = generate_kv_optimized(
-        model=model, idx=input_token_ids, max_new_tokens=1000,
+        model=model, idx=input_token_ids, max_new_tokens=max_new_tokens,
         context_size=QWEN3_CONFIG["context_length"], top_k=1,
         temperature=0, eos_id=None
     )
