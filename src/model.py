@@ -36,6 +36,7 @@ dtype = jax.dtypes.bfloat16
 #dtype = jnp.float16
 #dtype = jnp.float32
 cl = 40960
+#cl = 32000
 #cl = 128
 #cl = 8192
 #cl = 1024
@@ -347,6 +348,10 @@ def generate_kv_optimized(model, idx, max_new_tokens, context_size, temperature=
     #traced = jax.jit(gen, static_argnums=[3,4]).trace(params, logits, kv_cache, int(position_offset), max_new_tokens)
     vocab_size = cfg['vocab_size']
     logits = jnp.ones([1,1,vocab_size], dtype=dtype) / vocab_size
+    profile = False
+    if profile:
+        #max_new_tokens = 2
+        pass
     traced = jax.jit(gen, static_argnums=[4], donate_argnums=[]).trace(params, logits, kv_cache, int(position_offset), max_new_tokens)
     lowered = traced.lower()
     compiled_gen = lowered.compile()
@@ -355,7 +360,6 @@ def generate_kv_optimized(model, idx, max_new_tokens, context_size, temperature=
     # run prefill
     print('running prefill')
     stt = time.perf_counter()
-    profile = False
     if profile:
         jax.profiler.start_trace("/tmp/jax-trace1")#, profiler_options=options)
 
@@ -383,7 +387,7 @@ def generate_kv_optimized(model, idx, max_new_tokens, context_size, temperature=
         gc.collect()
 
     stt = time.time()
-    profile = False
+    profile = True
     if profile:
         jax.profiler.start_trace("/tmp/jax-trace1")#, profiler_options=options)
 
